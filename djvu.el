@@ -19,7 +19,7 @@
 ;; You should have received a copy of the GNU General Public License
 ;; along with djvu.el.  If not, see <http://www.gnu.org/licenses/>.
 
-;;; Commentary
+;;; Commentary:
 
 ;; djvu.el is a front end for the command-line program djvused
 ;; from DjVuLibre, see http://djvu.sourceforge.net/
@@ -98,13 +98,13 @@
 ;; backslash sequences. So djvu mode converts these backslash
 ;; sequences into the corresponding utf-8 characters. (More recent
 ;; versions of djvused can do this conversion, too.)
-;;
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;
 ;; Djvu internals:
 ;; (see /usr/share/doc/libdjvulibre-dev/djvu3spec.djvu)
 ;;
-;; Area attribute                        rect  oval  poly  line  text
+;; Supported area attributes             rect  oval  poly  line  text
 ;; (none)/(xor)/(border c)                X     X     X     X     X
 ;; (shadow_* t)                           X
 ;; (border_avis)                          X     X     X
@@ -115,7 +115,7 @@
 ;; c = #RRGGBB   t = thickness (1..32)
 ;; o = opacity = 0..100
 
-;;; Code
+;;; Code:
 
 (defvar djvu-color-highlight "yellow"
   "Default color for highlighting.")
@@ -258,19 +258,19 @@ refering to this Djvu document.")
   (interactive (list (completing-read "Color: " djvu-color-alist nil t)))
   (setq djvu-color-highlight color))
 
-(defun djvu-kill-view ()
-  (when (djvu-doc-view-proc)
-    (unless (memq (process-status (djvu-doc-view-proc))
+(defun djvu-kill-view (&optional doc)
+  (when (djvu-doc-view-proc doc)
+    (unless (memq (process-status (djvu-doc-view-proc doc))
                   '(exit signal))
-      (kill-process (djvu-doc-view-proc)))
-    (djvu-doc-set-view-proc nil)))
+      (kill-process (djvu-doc-view-proc doc)))
+    (djvu-doc-set-view-proc nil doc)))
 
-(defun djvu-kill-doc ()
+(defun djvu-kill-doc (&optional doc)
   (interactive)
-  (djvu-save nil t)
-  (djvu-kill-view)
-  (mapc 'kill-buffer (list (djvu-doc-text-buf) (djvu-doc-read-buf)
-                           (djvu-doc-annot-buf) (djvu-doc-outline-buf))))
+  (djvu-save doc t)
+  (djvu-kill-view doc)
+  (mapc 'kill-buffer (list (djvu-doc-text-buf doc) (djvu-doc-read-buf doc)
+                           (djvu-doc-annot-buf doc) (djvu-doc-outline-buf doc))))
 
 (defsubst djvu-delete-file (script)
   (unless djvu-test (delete-file script)))
@@ -514,36 +514,38 @@ If VIEW is non-nil start external viewer."
   (unless (file-regular-p file)
     (error "Cannot open Djvu file `%s'." file))
   ;; Initialize `djvu-doc' for FILE.
-  (let* ((doc (make-vector djvu-doc-length nil))
-         (djvu-doc doc)
-         (basename (file-name-sans-extension
+  (let* ((basename (file-name-sans-extension
                     (file-name-nondirectory file)))
          (read-buf  (concat basename (nth 0 djvu-buffer-name-extensions)))
          (text-buf  (concat basename (nth 1 djvu-buffer-name-extensions)))
          (annot-buf (concat basename (nth 2 djvu-buffer-name-extensions)))
          (outline-buf (concat basename (nth 3 djvu-buffer-name-extensions)))
-         (buffers (list text-buf read-buf annot-buf outline-buf)))
+         (buffers (list text-buf read-buf annot-buf outline-buf))
+         doc)
     ;; Do nothing if we are already visiting FILE such that all required
     ;; buffers are properly defined.  If some buffers were killed
     ;; do not attempt to recycle the remaining buffers.
-    (unless (eval (cons 'and (mapcar 'get-buffer buffers)))
+    (if (eval (cons 'and (mapcar 'get-buffer buffers)))
+        (with-current-buffer read-buf
+          (setq doc djvu-doc))
+      (setq doc (make-vector djvu-doc-length nil))
       (dolist (buf buffers)
         (if (get-buffer buf)  (kill-buffer buf)))
-      (djvu-doc-set-file file)
-      (djvu-doc-set-basename basename)
-      (djvu-doc-set-text-buf (get-buffer-create text-buf))
-      (djvu-doc-set-read-buf (get-buffer-create read-buf))
-      (djvu-doc-set-annot-buf (get-buffer-create annot-buf))
-      (djvu-doc-set-outline-buf (get-buffer-create outline-buf))
+      (djvu-doc-set-file file doc)
+      (djvu-doc-set-basename basename doc)
+      (djvu-doc-set-text-buf (get-buffer-create text-buf) doc)
+      (djvu-doc-set-read-buf (get-buffer-create read-buf) doc)
+      (djvu-doc-set-annot-buf (get-buffer-create annot-buf) doc)
+      (djvu-doc-set-outline-buf (get-buffer-create outline-buf) doc)
       ;; Initialize all buffers.
-      (dolist (buf (list (djvu-doc-text-buf) (djvu-doc-annot-buf)
-                         (djvu-doc-outline-buf)))
+      (dolist (buf (list (djvu-doc-text-buf doc) (djvu-doc-annot-buf doc)
+                         (djvu-doc-outline-buf doc)))
         (with-current-buffer buf
           (djvu-edit-mode)
           (setq djvu-doc doc)
           (cd (file-name-directory (djvu-doc-file)))
           (add-hook 'post-command-hook 'djvu-modified nil t)))
-      (with-current-buffer (djvu-doc-read-buf)
+      (with-current-buffer (djvu-doc-read-buf doc)
         (djvu-read-mode)
         (setq djvu-doc doc)
         (cd (file-name-directory (djvu-doc-file)))
@@ -750,7 +752,7 @@ If BACK is non-nil do inverse transformation."
   (interactive (list djvu-doc))
   (if (not (window-system))
       (message "No window system available")
-    (djvu-kill-view)
+    (djvu-kill-view doc)
     (let* ((djvu-doc doc)
            (pos (or (djvu-doc-pos) (djvu-read-pos)))
            (px (/ (float (car pos))
