@@ -155,8 +155,8 @@ This is a list with four elements (READ TEXT ANNOT OUTLINE).")
 
 (defvar djvu-resolve-url nil
   "Flag for resolving internal URLs.
-If 'long replace short page numbers by long FileIDs.
-If 'short replace long FileIDs by short page numbers.
+If `long' replace short page numbers by long FileIDs.
+If `short' replace long FileIDs by short page numbers.
 If nil do nothing.")
 
 (defvar djvu-image-size 1024
