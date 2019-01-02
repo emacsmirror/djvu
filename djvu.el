@@ -4,7 +4,7 @@
 
 ;; Author: Roland Winkler <winkler@gnu.org>
 ;; Keywords: files, wp
-;; Version: 1.0
+;; Version: 1.0.1
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -149,6 +149,10 @@
 
 ;;; News:
 
+;; v1.0.1:
+;; - Use `create-file-buffer' instead of `generate-new-buffer'
+;;   for compatibility with uniquify.
+;;
 ;; v1.0:
 ;; - New commands `djvu-revert-buffer', `djvu-re-search-forward',
 ;;   `djvu-re-search-forward-continue', `djvu-history-backward',
@@ -166,14 +170,6 @@
 ;; - Shared annotations buffer.
 ;;
 ;; - Font locking.
-
-;;; To do:
-;;
-;; - Use uniquify instead of `generate-new-buffer' if we visit multiple
-;;   djvu documents in different directories but with the same nondirectory
-;;   file name.  However, uniquify's usual machinery based on advicing
-;;   `create-file-buffer' does not work for us because we never visit a file
-;;   in the ordinary emacs sense.
 
 ;;; Code:
 
@@ -479,7 +475,8 @@ DOC defaults to `djvu-doc'."
 (defun djvu-header-line (identifier)
   (list (propertize " " 'display '(space :align-to 0))
         ;; Emacs >= 26: compare `proced-header-line'
-        (format "-- %s: %s" identifier buffer-file-truename)))
+        (format "%s -- %s (p%d)" (buffer-name (djvu-ref read-buf))
+                identifier (djvu-ref page))))
 
 (defsubst djvu-substring-number (string &optional from to base)
   "Parse substring of STRING as a decimal number and return the number.
@@ -1042,8 +1039,7 @@ This is a child of `special-mode-map'.")
   (setq djvu-buffer 'read
         buffer-undo-list t
         mode-line-buffer-identification
-        (list 24 (buffer-name)
-              '(:eval (format "  p%d" (djvu-ref page)))))
+        (list 24 '(:eval (format "%s  p%d" (buffer-name) (djvu-ref page)))))
   (set (make-local-variable 'revert-buffer-function) 'djvu-revert-buffer))
 
 (defvar djvu-script-mode-map
@@ -1124,8 +1120,9 @@ This is a child of `lisp-mode-map'.")
 (define-derived-mode djvu-script-mode lisp-mode "Djvu Script"
   "Mode for editing Djvu scripts."
   (setq mode-line-buffer-identification
-        (list 24 (buffer-name)
-              '(:eval (if djvu-doc (format "  p%d" (djvu-ref page)) "")))
+        (list 24 '(:eval (if djvu-doc
+                             (format "%s  p%d" (buffer-name)
+                                     (djvu-ref page)) "")))
         fill-column djvu-fill-column
         font-lock-defaults '(djvu-font-lock-keywords))
   (set (make-local-variable 'revert-buffer-function) 'djvu-revert-buffer))
@@ -1192,8 +1189,7 @@ This is a child of `special-mode-map'.")
   (setq djvu-buffer 'outline
         buffer-undo-list t
         mode-line-buffer-identification
-        (list 24 (buffer-name)
-              '(:eval (format "  p%d" (djvu-ref page)))))
+        (list 24 '(:eval (format "%s  p%d" (buffer-name) (djvu-ref page)))))
   (set (make-local-variable 'revert-buffer-function) 'djvu-revert-buffer))
 
 ;;; General Setup
@@ -1257,9 +1253,17 @@ from file."
                                        (djvu-ref file doc)))))))
       (unless old-bufs
         (cl-flet ((fun (n)
-                    (generate-new-buffer
-                     (concat buf-basename
-                             (nth n djvu-buffer-name-extensions)))))
+                       ;; Instead of `generate-new-buffer', we take a detour
+                       ;; via `create-file-buffer' so that uniquify can do
+                       ;; its job, too.  It does not matter that the arg of
+                       ;; `create-file-buffer' does not match `buffer-file-name'
+                       ;; because `uniquify-buffer-file-name' only cares
+                       ;; about DIR.
+                       (create-file-buffer ; needed by uniquify
+                        (expand-file-name
+                         (concat buf-basename
+                                 (nth n djvu-buffer-name-extensions))
+                         dir))))
           (setq doc (fun 0))
           (djvu-set read-buf doc doc)
           (djvu-set text-buf (fun 1) doc)
@@ -1299,6 +1303,8 @@ from file."
       (djvu-all-buffers doc
         (setq djvu-doc doc ; propagate DOC to all buffers
               buffer-file-name file
+              ;; A non-nil value of `buffer-file-truename' enables file-locking,
+              ;; see call of `lock_file' in `prepare_to_modify_buffer_1'
               buffer-file-truename file-truename
               buffer-file-number file-number
               buffer-file-read-only read-only
