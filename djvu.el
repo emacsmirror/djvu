@@ -4,7 +4,7 @@
 
 ;; Author: Roland Winkler <winkler@gnu.org>
 ;; Keywords: files, wp
-;; Version: 1.0.1
+;; Version: 1.1
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -43,24 +43,10 @@
 ;;
 ;; A normal work flow is as follows:
 ;;
-;; To visit a djvu file type M-x djvu-find-file.  This command is the
-;; only entry point to this package.  You can bind this command to a key,
-;; for example
-;;
-;;   (global-set-key "\C-cd" 'djvu-find-file)
-;;
-;; Or you can use something more general like
-;;
-;;   (defun djvu-find-file-noselect (f-f-n filename &rest args)
-;;     "If FILENAME is a Djvu file call `djvu-find-file'."
-;;     (if (string-match "\\.djvu\\'" (file-name-sans-versions filename))
-;;         (djvu-find-file filename nil nil t)
-;;       (apply f-f-n filename args)))
-;;   (advice-add 'find-file-noselect :around #'djvu-find-file-noselect)
-;;
-;; If you use `djvu-find-file' to visit the file foo.djvu, it puts you into
-;; the (read-only) buffer foo.djvu.  Normally, this buffer (plus possibly
-;; the outline buffer) is all you need.
+;; Djvu files are assumed to have the file extension ".djvu".
+;; When you visit the file foo.djvu, it puts you into the (read-only)
+;; buffer foo.djvu.  Normally, this buffer (plus possibly the outline buffer)
+;; is all you need.
 ;;
 ;; The menu bar of this buffer lists most of the commands with their
 ;; respective key bindings.  For example, you can:
@@ -149,6 +135,24 @@
 
 ;;; News:
 
+;; v1.1:
+;; - Use `auto-mode-alist' with file extension ".djvu".
+;;
+;; - Support bookmarks.
+;;
+;; - Display total number of pages in mode line.
+;;
+;; - New option `djvu-rect-area-nodups'.
+;;
+;; - User options `djvu-save-after-edit' and `djvu-region-history' removed
+;;   (obsolete).
+;;
+;; - More robust code for merging lines in text layer.
+;;
+;; - Clean up handling of editing positions in a djvu document.
+;;
+;; - Bug fixes.
+;;
 ;; v1.0.1:
 ;; - Use `create-file-buffer' instead of `generate-new-buffer'
 ;;   for compatibility with uniquify.
@@ -171,6 +175,19 @@
 ;;
 ;; - Font locking.
 
+;;; To do:
+
+;; - Auto-save script buffers.  How can we recover these buffers
+;;   in a meaningful way?
+;;
+;; - Use `replace-buffer-contents'?
+;;
+;; - New command that makes line breaks in text layer better searchable:
+;;   Scan text layer for lines ending with hyphenated words "xxx-".
+;;   If the first word of the next line is "yyy" and ispell knows
+;;   the word "xxxyyy", replace "yyy" with that string.  A search
+;;   for the word "xxxyyy" will then succeed.
+
 ;;; Code:
 
 ;;; Djvu internals (see Sec. 8.3.4.2.3.1 of djvu3spec.djvu)
@@ -185,6 +202,8 @@
 ;;
 ;; c = #RRGGBB   t = thickness (1..32)
 ;; o = opacity = 0..200 (yes)
+;;
+;; zones: page, column, region, para, line, word, and char
 
 (require 'button)
 (eval-when-compile
@@ -274,13 +293,6 @@ This is a list with six elements (READ TEXT ANNOT SHARED BOOKMARKS OUTLINE)."
   :group 'djvu
   :type 'integer)
 
-;; FIXME: The proper and efficient alternative to saving the changes
-;; is to update the read buffer so that these buffers are consistent.
-(defcustom djvu-save-after-edit t
-  "If non-nil save Djvu document after each call of a text editing command."
-  :group 'djvu
-  :type 'boolean)
-
 (defcustom djvu-inherit-input-method t
   "If non-nil calls of `read-string' inherit the input method."
   :group 'djvu
@@ -301,11 +313,6 @@ This is a list with six elements (READ TEXT ANNOT SHARED BOOKMARKS OUTLINE)."
 These extensions include the period."
   :group 'djvu
   :type 'regexp)
-
-(defcustom djvu-region-history t
-  "If non-nil `djvu-read-string' pushes region to `minibuffer-history'."
-  :group 'djvu
-  :type 'boolean)
 
 (defcustom djvu-read-prop-newline 2
   "Number of newline characters in Read buffer for consecutive region."
@@ -332,6 +339,11 @@ Used by `djvu-region-string'."
   :group 'djvu
   :type '(repeat (cons (regexp) (string))))
 
+(defcustom djvu-rect-area-nodups nil
+  "If non-nil `djvu-rect-area' does not create multiple rects for same areas."
+  :group 'djvu
+  :type 'boolean)
+
 ;; Internal variables
 
 (defvar djvu-test nil
@@ -345,6 +357,7 @@ Used by `djvu-region-string'."
   "Expanded rect list for propertizing the Read buffer.
 This is a list with elements (COORDS URL TEXT COLOR ID) stored
 in `djvu-doc-rect-list'.")
+
 (defvar djvu-last-rect nil
   "Last rect used for propertizing the Read buffer.
 This is a list (BEG END COORDS URL TEXT COLOR).")
@@ -435,11 +448,14 @@ Each element is a cons pair (PAGE-NUM . FILE-ID).")
 (defvar-local djvu-doc-pagesize nil
   "Size of current page of a Djvu document.")
 
-(defvar-local djvu-doc-dpos nil
-  "The current editing position in a Djvu document.")
+(defvar-local djvu-doc-read-pos nil
+  "The current editing position in the Read buffer (image coordinates).
+This is either a list (X Y) or a list or vector (XMIN YMIN XMAX YMAX).
+Used in `djvu-image-mode' when we cannot go to this position.")
 
 (defvar-local djvu-doc-image nil
-  "Image of current page of a Djvu document.")
+  "Image of current page of a Djvu document.
+This is a list (PAGE-NUM MAGNIFICATION IMAGE).")
 
 ;;; Helper functions and macros
 
@@ -514,21 +530,19 @@ Preserve FILE if `djvu-test' is non-nil."
   "Switch to Djvu Read buffer."
   (interactive (list nil (djvu-dpos)))
   (switch-to-buffer (djvu-ref read-buf doc))
-  (if dpos (djvu-goto-read dpos)))
+  (djvu-goto-read dpos))
 
 (defun djvu-switch-text (&optional doc dpos)
   "Switch to Djvu Text buffer."
   (interactive (list nil (djvu-dpos)))
   (switch-to-buffer (djvu-ref text-buf doc))
-  (if dpos (djvu-goto-dpos 'word dpos)))
+  (djvu-goto-dpos 'word dpos))
 
 (defun djvu-switch-annot (&optional doc dpos)
   "Switch to Djvu Annotations buffer."
   (interactive (list nil (djvu-dpos)))
   (switch-to-buffer (djvu-ref annot-buf doc))
-  (if (and dpos
-           (or (djvu-goto-dpos 'rect dpos)
-               (djvu-goto-dpos 'text dpos)))
+  (if (djvu-goto-dpos "\\(?:rect\\|text\\)" dpos)
       ;; If we have matching buffer position in the annotations buffer,
       ;; put point at the end of the annotations string.
       (re-search-backward "\"")))
@@ -566,13 +580,12 @@ Preserve FILE if `djvu-test' is non-nil."
 
 (defun djvu-dpos (&optional doc)
   "Djvu position in current Djvu buffer."
-  (let ((dpos (cond ((eq djvu-buffer 'read)
-                     (djvu-read-dpos nil doc))
-                    ((eq djvu-buffer 'text)
-                     (djvu-text-dpos nil doc))
-                    ((eq djvu-buffer 'annot)
-                     (djvu-annot-dpos nil doc)))))
-    (if dpos (djvu-set dpos dpos doc))))
+  (cond ((eq djvu-buffer 'read)
+         (djvu-read-dpos nil doc))
+        ((eq djvu-buffer 'text)
+         (djvu-text-dpos nil doc))
+        ((eq djvu-buffer 'annot)
+         (djvu-annot-dpos nil doc))))
 
 (defun djvu-read-page ()
   "Read page number interactively."
@@ -644,6 +657,7 @@ This relies on `djvu-kill-doc-all' for doing the real work."
 
 (defvar djvu-in-kill-doc nil
   "Non-nil if we are running `djvu-kill-doc-all'.")
+
 (defun djvu-kill-doc-all ()
   "Kill all buffers visiting `djvu-doc' except for the current buffer.
 This function is added to `kill-buffer-hook' of all buffers visiting `djvu-doc'
@@ -671,7 +685,6 @@ so that killing the current buffer kills all buffers visiting `djvu-doc'."
   (interactive)
   (unless doc (setq doc djvu-doc))
   (let ((afile (abbreviate-file-name (djvu-ref file doc)))
-        (dpos (djvu-read-dpos nil doc))
         (text-modified  (buffer-modified-p (djvu-ref text-buf doc)))
         (annot-modified (buffer-modified-p (djvu-ref annot-buf doc)))
         (shared-modified (buffer-modified-p (djvu-ref shared-buf doc)))
@@ -685,16 +698,13 @@ so that killing the current buffer kills all buffers visiting `djvu-doc'."
       (djvu-with-temp-file script
         (if annot-modified (djvu-save-annot script doc))
         (if shared-modified (djvu-save-annot script doc t))
-        (if text-modified (djvu-save-text script doc)) ; updates Read buffer
+        (if text-modified (djvu-save-text doc script)) ; updates Read buffer
         (if bookmarks-modified (djvu-save-bookmarks script doc))
         (djvu-djvused doc nil "-f" script "-s"))
       (if (and annot-modified (not text-modified))
           (djvu-init-read (djvu-read-text doc) doc))
       (djvu-all-buffers doc
-        (set-buffer-modified-p nil))
-      ;; Update the buffer position in the Read buffer that was lost
-      ;; when updating the Read buffer.
-      (if text-modified (djvu-goto-read dpos)))))
+        (set-buffer-modified-p nil)))))
 
 (defun djvu-modified ()
   "Mark Djvu Read and Outline buffers as modified if necessary.
@@ -785,6 +795,7 @@ the purpose of calling djvused is to update the Djvu file."
 
 (defvar djvu-color-attributes '(border hilite lineclr backclr textclr)
   "List of color attributes known to Djvu.")
+
 (defvar djvu-color-re
   (concat "(" (regexp-opt (mapcar 'symbol-name djvu-color-attributes) t)
           "[ \t\n]+\\(%s\\(%s[[:xdigit:]][[:xdigit:]]"
@@ -846,11 +857,8 @@ If INITIAL-INPUT is non-nil use string from REGION as initial input."
       ;; Make the string in REGION the initial input.
       (read-string prompt (djvu-region-string region)
                    nil nil djvu-inherit-input-method)
-    ;; Let `minibuffer-history' know the string in REGION.
-    ;; Should we remove this string afterwards?
-    (if djvu-region-history
-        (add-to-history 'minibuffer-history (djvu-region-string region)))
-    (read-string prompt nil nil nil djvu-inherit-input-method)))
+    (read-string prompt nil nil (djvu-region-string region)
+                 djvu-inherit-input-method)))
 
 (defun djvu-interactive-color (color)
   "Return color specification for use in interactive calls.
@@ -1034,13 +1042,21 @@ This is a child of `special-mode-map'.")
     ["Quit Viewing" djvu-quit-window t]
     ["Kill Djvu buffers" djvu-kill-doc t]))
 
+(defvar bookmark-make-record-function)
+
 (define-derived-mode djvu-read-mode special-mode "Djview"
   "Mode for reading Djvu files."
-  (setq djvu-buffer 'read
-        buffer-undo-list t
-        mode-line-buffer-identification
-        (list 24 '(:eval (format "%s  p%d" (buffer-name) (djvu-ref page)))))
-  (set (make-local-variable 'revert-buffer-function) 'djvu-revert-buffer))
+  ;; The Read buffer is not editable.  So do not create auto-save files.
+  (setq buffer-auto-save-file-name nil ; permanent buffer-local
+        djvu-buffer 'read
+        buffer-undo-list t)
+  (let ((fmt (concat (car (propertized-buffer-identification "%s"))
+                     "  p%d/%d")))
+    (setq mode-line-buffer-identification
+          `(24 (:eval (format ,fmt (buffer-name) (djvu-ref page)
+                              (djvu-ref pagemax))))))
+  (setq-local revert-buffer-function #'djvu-revert-buffer)
+  (setq-local bookmark-make-record-function #'djvu-bookmark-make-record))
 
 (defvar djvu-script-mode-map
   (let ((km (make-sparse-keymap)))
@@ -1101,7 +1117,8 @@ This is a child of `lisp-mode-map'.")
 (defvar djvu-font-lock-keywords
   `((,(concat "^[ \t]*("
               (regexp-opt '("background" "zoom" "mode" "align"
-                            "maparea" "metadata" "bookmarks" "xmp") t))
+                            "maparea" "metadata" "bookmarks" "xmp")
+                          t))
      1 font-lock-keyword-face)
     (,(concat "\\(?:[ \t]+\\|^\\|(\\)("
               (regexp-opt '("url" "rect" "oval" "poly" "text" "line"
@@ -1118,14 +1135,23 @@ This is a child of `lisp-mode-map'.")
   "Font lock keywords for Djvu buffers.")
 
 (define-derived-mode djvu-script-mode lisp-mode "Djvu Script"
-  "Mode for editing Djvu scripts."
-  (setq mode-line-buffer-identification
-        (list 24 '(:eval (if djvu-doc
-                             (format "%s  p%d" (buffer-name)
-                                     (djvu-ref page)) "")))
+  "Mode for editing Djvu scripts.
+The annotations, shared annotations and bookmark buffers use this mode."
+  ;; Fixme: we should create auto-save files for the script buffers.
+  ;; This requires suitable names for the auto-save files that should
+  ;; be derived from `buffer-file-name'.
+  (setq buffer-auto-save-file-name nil ; permanent buffer-local
         fill-column djvu-fill-column
         font-lock-defaults '(djvu-font-lock-keywords))
-  (set (make-local-variable 'revert-buffer-function) 'djvu-revert-buffer))
+  (let* ((fmt1 (car (propertized-buffer-identification "%s")))
+         (fmt2 (concat fmt1 "  p%d/%d")))
+    (setq mode-line-buffer-identification
+          `(24 (:eval (if djvu-doc
+                          (format ,fmt2 (buffer-name) (djvu-ref page)
+                                  (djvu-ref pagemax))
+                        (format ,fmt1 (buffer-name)))))))
+  (setq-local revert-buffer-function #'djvu-revert-buffer)
+  (setq-local bookmark-make-record-function #'djvu-bookmark-make-record))
 
 (defvar djvu-outline-mode-map
   (let ((km (make-sparse-keymap)))
@@ -1186,13 +1212,30 @@ This is a child of `special-mode-map'.")
 
 (define-derived-mode djvu-outline-mode special-mode "Djvu OL"
   "Mode for reading the outline of Djvu files."
-  (setq djvu-buffer 'outline
-        buffer-undo-list t
-        mode-line-buffer-identification
-        (list 24 '(:eval (format "%s  p%d" (buffer-name) (djvu-ref page)))))
-  (set (make-local-variable 'revert-buffer-function) 'djvu-revert-buffer))
+  ;; The Outline buffer is not editable.  So do not create auto-save files.
+  (setq buffer-auto-save-file-name nil ; permanent buffer-local
+        djvu-buffer 'outline
+        buffer-undo-list t)
+  (let ((fmt (concat (car (propertized-buffer-identification "%s"))
+                     "  p%d/%d")))
+    (setq mode-line-buffer-identification
+          `(24 (:eval (format ,fmt (buffer-name) (djvu-ref page)
+                              (djvu-ref pagemax))))))
+  (setq-local revert-buffer-function #'djvu-revert-buffer)
+  (setq-local bookmark-make-record-function #'djvu-bookmark-make-record))
 
 ;;; General Setup
+
+;;;###autoload
+(add-to-list 'auto-mode-alist '("\\.djvu\\'" . djvu-dummy-mode))
+
+;;;###autoload
+(defun djvu-dummy-mode ()
+  "Djvu dummy mode for `auto-mode-alist'."
+  (djvu-find-file buffer-file-name nil nil t))
+
+;; FIXME: Add entry for `change-major-mode-hook'.
+;; How should this handle the plethora of buffers per djvu document?
 
 (defun djvu-read-file-name ()
   "Read file name of Djvu file.
@@ -1227,10 +1270,12 @@ from file."
          (file-number (nthcdr 10 (file-attributes file)))
          (dir (file-name-directory file))
          (read-only (not (file-writable-p file)))
-         (doc (let ((old-buf (find-buffer-visiting file-truename)))
-                (and old-buf (buffer-local-value 'djvu-doc old-buf))))
+         (old-buf (if (equal buffer-file-truename file-truename)
+                      (current-buffer)
+                    (find-buffer-visiting file-truename)))
+         (doc (and old-buf (buffer-local-value 'djvu-doc old-buf)))
          (old-bufs (and doc (mapcar 'buffer-live-p (djvu-buffers doc)))))
-    ;; Sanity check (we should never need this)
+    ;; Sanity check.  We should never need this.
     (when (and old-bufs (memq nil old-bufs))
       (message "Killing dangling Djvu buffers...")
       (djvu-kill-doc doc)
@@ -1264,7 +1309,19 @@ from file."
                          (concat buf-basename
                                  (nth n djvu-buffer-name-extensions))
                          dir))))
-          (setq doc (fun 0))
+          (if old-buf
+              ;; This applies if `find-file-noselect' created OLD-BUF
+              ;; in order to visit FILE.  Hence recycle OLD-BUF as Read
+              ;; buffer so that `find-file-noselect' can do its job.
+              ;; FIXME: this ignores `djvu-buffer-name-extensions'
+              ;; because renaming OLD-BUF would break `uniquify'.
+              (with-current-buffer old-buf
+                (let ((inhibit-read-only t)
+                      (buffer-undo-list t))
+                  (erase-buffer))
+                (setq buffer-file-coding-system 'prefer-utf-8)
+                (setq doc old-buf))
+            (setq doc (fun 0)))
           (djvu-set read-buf doc doc)
           (djvu-set text-buf (fun 1) doc)
           (djvu-set annot-buf (fun 2) doc)
@@ -1272,7 +1329,7 @@ from file."
           (djvu-set bookmarks-buf (fun 4) doc)
           (djvu-set outline-buf (fun 5) doc)))
       ;; Of course, we have
-      ;; `djvu-doc' = `djvu-doc-read-buf'
+      ;; `djvu-doc-read-buf' = `djvu-doc'
       ;; `djvu-doc-file' = `buffer-file-name'.  Bother?
       ;; It seems Emacs does not like aliases for buffer-local variables.
       (djvu-set file file doc)
@@ -1311,8 +1368,8 @@ from file."
               ;; We assume that all buffers for a Djvu document have the same
               ;; read-only status.  Should we allow different values for the
               ;; buffers of one document?  Or do we need a `djvu-read-only-mode'?
-              buffer-read-only read-only)
-        (cd-absolute dir)
+              buffer-read-only read-only
+              default-directory dir)
         (set-visited-file-modtime)
         (add-hook 'post-command-hook 'djvu-modified nil t)
         (add-hook 'kill-buffer-hook 'djvu-kill-doc-all nil t))
@@ -1421,7 +1478,6 @@ PAGE is re-initialized if we are already viewing it."
   (if (or (buffer-modified-p (djvu-ref text-buf doc))
           (buffer-modified-p (djvu-ref annot-buf doc)))
       (djvu-save doc t))
-  (djvu-set dpos nil doc)
   ;; We process PAGE unconditionally, even if it equals the page
   ;; currently displayed.  Most often, PAGE equals the current page
   ;; if we want to redisplay PAGE.
@@ -1439,6 +1495,8 @@ PAGE is re-initialized if we are already viewing it."
                   doc))
     (djvu-set history-forward nil doc)
     (djvu-set page page doc)
+    ;; Fix me: Restore buffer positions if we revisit the same page.
+    (djvu-set read-pos nil doc)
     (with-temp-buffer
       (djvu-djvused doc t "-e"
                     (format "select %d; size; print-txt; print-ant;"
@@ -1462,22 +1520,18 @@ PAGE is re-initialized if we are already viewing it."
       (skip-chars-forward " \t\n")
       (let ((object (if (looking-at "(\\(page\\|column\\|region\\|para\\|line\\|word\\|char\\)")
                         (read (current-buffer)))))
-        (with-current-buffer (djvu-ref text-buf doc)
-          (let (buffer-read-only)
-            (erase-buffer)
-            (djvu-insert-text object "")
-            (insert "\n")
-            (goto-char (point-min))
-            (set-buffer-modified-p nil)
-            (setq buffer-undo-list nil)))
-
-        ;; Set up annotations buffer:
+        ;; Set up annotations buffer.
+        ;; This also initializes `djvu-doc-rect-list' that we need
+        ;; for propertizing the read buffer.
         (save-restriction
           (narrow-to-region (point) (point-max))
           (djvu-init-annot (djvu-ref annot-buf doc) doc))
 
+        ;; Set up text buffer
+        (djvu-init-text object doc t)
+
         ;; Set up read buffer
-        (djvu-init-read object doc)))))
+        (djvu-init-read object doc t)))))
 
 (defalias 'djvu-goto-page 'djvu-init-page
   "Goto PAGE of Djvu document DOC.")
@@ -1703,7 +1757,7 @@ The command `djvu-re-search-forward-continue' continues to search forward."
                      (looking-at (regexp-quote (prin1-to-string old)))))
         (error "`%s' not found" old))
       (replace-match (prin1-to-string new) t t)))
-  (if djvu-save-after-edit (djvu-save) (djvu-goto-read)))
+  (djvu-save-text))
 
 (defun djvu-split-word (bpos)
   "Split word at buffer position BPOS.
@@ -1711,11 +1765,10 @@ This command operates on the read buffer."
   (interactive "d")
   (let ((beg (djvu-property-beg bpos 'word))
         (dpos (djvu-read-dpos bpos)))
-    (djvu-set dpos dpos)
     (with-current-buffer (djvu-ref text-buf)
       (djvu-split-word-internal (djvu-goto-dpos 'word dpos)
                                 (- bpos beg))))
-  (if djvu-save-after-edit (djvu-save) (djvu-goto-read)))
+  (djvu-save-text))
 
 (defun djvu-split-word-internal (wpos split)
   "Split word at position WPOS at character position SPLIT.
@@ -1759,11 +1812,10 @@ This command operates on the read buffer."
   (interactive "r")
   (let ((bpos (djvu-read-dpos beg))
         (epos (djvu-read-dpos (1- end))))
-    (djvu-set dpos bpos)
     (with-current-buffer (djvu-ref text-buf)
       (djvu-merge-words-internal (djvu-goto-dpos 'word bpos)
                                  (djvu-goto-dpos 'word epos))))
-  (if djvu-save-after-edit (djvu-save) (djvu-goto-read)))
+  (djvu-save-text))
 
 (defun djvu-merge-words-internal (beg end)
   "Merge words between positions BEG and END.
@@ -1776,11 +1828,10 @@ This command operates on the text buffer."
     (beginning-of-line)
     (skip-chars-forward " \t")
     (setq beg (point))
-    (condition-case nil
-        (while (< (point) end)
-          (push (read (current-buffer)) words)
-          (unless (eq 'word (caar words)) (error "Invalid")))
-      (error (error "Syntax error in raw text")))
+    (while (< (point) end)
+      (push (read (current-buffer)) words)
+      (unless (eq 'word (caar words))
+        (error "Syntax error in raw text")))
     (delete-region beg (point))
     (let ((object (apply 'list 'word 0 0 0 0 (nreverse words))))
       (djvu-text-zone object 0 (make-vector 3 nil))
@@ -1798,11 +1849,10 @@ This command operates on the read buffer."
   ;; merely run `djvu-merge-lines-internal' in the text buffer.
   (let ((bpos (djvu-read-dpos beg))
         (epos (djvu-read-dpos (1- end))))
-    (djvu-set dpos bpos)
     (with-current-buffer (djvu-ref text-buf)
       (djvu-merge-lines-internal (djvu-goto-dpos 'word bpos)
                                  (djvu-goto-dpos 'word epos))))
-  (if djvu-save-after-edit (djvu-save) (djvu-goto-read)))
+  (djvu-save-text))
 
 (defun djvu-merge-lines-internal (beg end)
   "Merge lines between positions BEG and END.
@@ -1810,45 +1860,55 @@ This command operates on the text buffer."
   (interactive "r")
   ;; Calculate proper value of END
   (goto-char end)
-  (beginning-of-line)
-  (unless (looking-at "[ \t]*(line ")
-    (re-search-backward "^[ \t]*(line ")
-    (forward-sexp)
-    (setq end (point)))
+  (unless (looking-at "[ \t]*(word ")
+    (re-search-backward "^[ \t]*(word "))
+  (forward-sexp)
+  (setq end (point))
   ;; Calculate proper value of BEG
   (goto-char beg)
-  (beginning-of-line)
-  (unless (looking-at "[ \t]*(line ")
-    (re-search-backward "^[ \t]*(line "))
+  (unless (looking-at "[ \t]*(word ")
+    (re-search-backward "^[ \t]*(word "))
   (skip-chars-forward " \t")
   (setq beg (point))
-  (unless (< beg end) (error "Nothing to merge"))
-  ;; Parsing fails if the words belong to different paragraphs,
-  ;; regions or columns.  We would have to determine the lowest common
-  ;; object level of these words.  Then we could possibly merge
-  ;; everything (!) within this level
-  (if (re-search-forward "^[ \t]*\\(?:para\\|region\\|column\\)" end t)
-      (user-error "Cannot merge paragraphs, regions or columns"))
-  (let (words)
-    ;; Collect all words, ignore line headers
-    (condition-case nil
-        (while (<= (point) end)
-          (cond ((looking-at "[ \t]*(word ")
-                 (push (read (current-buffer)) words))
-                ((not (looking-at "[ \t]*(line "))
-                 (error "Invalid")))
-          (forward-line))
-      (error (error "Syntax error in raw text")))
-    ;; Remove old words
-    (goto-char beg)
-    (delete-region beg end)
-    ;; Re-insert words
-    (let ((indent (delete-and-extract-region
-                   (line-beginning-position) (point)))
-          (object (apply 'list 'line 0 0 0 0 (nreverse words))))
-      (djvu-text-zone object 0 (make-vector 3 nil))
-      (djvu-insert-text object indent)))
-  (undo-boundary))
+  (unless (< beg end) (user-error "Nothing to merge"))
+  ;; The following fails if the zone levels of the lines we want to merge
+  ;; are different.  For example:
+  ;; (line X X X X
+  ;;  (word X X X X string)
+  ;;  (word X X X X string))
+  ;; (para X X X X
+  ;;  (line X X X X
+  ;;   (word X X X X string)
+  ;;   (word X X X X string)))
+  (atomic-change-group
+    (save-restriction
+      (narrow-to-region beg end)
+      (mapc (lambda (zone)
+              (goto-char (point-min))
+              (let ((re (format ")[\n\t\s]+(%s [0-9]+ [0-9]+ [0-9]+ [0-9]+" zone)))
+                (while (re-search-forward re nil t)
+                  (replace-match ""))))
+            '("column" "region" "para" "line"))
+      ;; Check that we got what we want.
+      (goto-char (point-min))
+      (while (> (point-max) (progn (skip-chars-forward "\n\t\s") (point)))
+        (if (looking-at "(word ")
+            (forward-sexp) ; may signal `scan-error'
+          (error "Syntax error: cannot merge"))))))
+
+(defun djvu-init-text (object &optional doc reset)
+  "Initialize Text buffer."
+  (with-current-buffer (djvu-ref text-buf doc)
+    (let ((dpos (unless reset (djvu-text-dpos nil doc)))
+          buffer-read-only)
+      (erase-buffer)
+      (djvu-insert-text object "")
+      (insert "\n")
+      (if (not reset)
+          (djvu-goto-dpos 'word dpos)
+        (goto-char (point-min))
+        (set-buffer-modified-p nil)
+        (setq buffer-undo-list nil)))))
 
 (defun djvu-insert-text (object indent)
   "Insert OBJECT into Djvu text buffer recursively using indentation INDENT."
@@ -1905,23 +1965,37 @@ This command operates on the text buffer."
               (error "Syntax error in raw text (end of buffer)"))))))
     object))
 
-(defun djvu-save-text (script &optional doc)
-  "Save text of the Djvu document DOC.
-This dumps the content of DOC's text buffer into the djvused script
-file SCRIPT.  DOC defaults to the current Djvu document."
+(defun djvu-save-text (&optional doc script)
+  "Save text of the Djvu document DOC.  This updates the Read buffer for DOC.
+DOC defaults to the current Djvu document.
+If SCRIPT is non-nil, dump the text buffer into the djvused script file SCRIPT."
+  (interactive)
   (unless doc (setq doc djvu-doc))
-  (let ((object (djvu-read-text doc)))
-    (djvu-text-zone object 0 (make-vector 7 nil))
-    ;; Update read buffer
-    (djvu-init-read object doc)
-    ;; FIXME: Update the higher text zones displayed in the text buffer
-    ;; if we modified lower-level zones.
-    (with-temp-buffer
-      (setq buffer-file-coding-system 'utf-8)
-      (insert (format "select %d\nremove-txt\nset-txt\n" (djvu-ref page doc)))
-      (djvu-insert-text object "")
-      (insert "\n.\n") ; see djvused command set-txt
-      (write-region nil nil script t 0)))) ; append to SCRIPT
+  (let ((object1 (djvu-read-text doc))
+        (object2 (djvu-read-text doc))) ; true recursive copy of OBJECT1
+    ;; Re-initializing the text buffer blows up the undo list of this buffer.
+    ;; This step is only needed if we changed the text zones (e.g., when
+    ;; merging lines).  So we check whether `djvu-text-zone' has changed
+    ;; OBJECT.  For this, it is easier to read OBJECT twice than copying it
+    ;; recursively.
+    (djvu-text-zone object1 0 (make-vector 7 nil))
+    (unless (equal object1 object2)
+      (djvu-init-text object1 doc))
+    ;; Update read buffer.  We do this even if the text buffer is not
+    ;; modified, as we may have undone a change in the text buffer that
+    ;; previously propagated also into the read buffer.  The Read buffer
+    ;; has no undo list.
+    (djvu-init-read object1 doc)
+    ;; It is a bit of a hack to use this command for two rather different
+    ;; purposes.  But we do not want to read OBJECT one more time.
+    (if script
+        (with-temp-buffer
+          (setq buffer-file-coding-system 'utf-8)
+          (insert (format "select %d\nremove-txt\nset-txt\n"
+                          (djvu-ref page doc)))
+          (djvu-insert-text object1 "")
+          (insert "\n.\n") ; see djvused command set-txt
+          (write-region nil nil script t 0))))) ; append to SCRIPT
 
 (defun djvu-text-zone (object depth zones)
   "Evaluate zones for text OBJECT recursively."
@@ -2012,16 +2086,19 @@ BUFFER defaults to `djvu-script-buffer'.  If BUFFER is t, use current buffer."
 
 ;;; Djvu Read mode
 
-(defun djvu-init-read (object &optional doc)
+(defun djvu-init-read (object &optional doc reset)
   (with-current-buffer (djvu-ref read-buf doc)
     (let ((djvu-rect-list (djvu-ref rect-list doc))
+          (dpos (unless reset (djvu-read-dpos nil doc)))
           buffer-read-only djvu-last-rect)
       (erase-buffer)
       (djvu-insert-read object)
-      (djvu-insert-read-prop))
+      (djvu-insert-read-prop)
+      (if reset
+          (goto-char (point-min))
+        (djvu-goto-read dpos)))
     (set-buffer-modified-p nil)
     (setq buffer-read-only t)
-    (djvu-goto-read (djvu-ref dpos doc))
     (djvu-image)))
 
 (defun djvu-insert-read (object)
@@ -2100,7 +2177,8 @@ BUFFER defaults to `djvu-script-buffer'.  If BUFFER is t, use current buffer."
   "Return Djvu position of POINT in Djvu Read buffer.
 This is either a list (XMIN YMIN XMAX YMAX) or (X Y)."
   (with-current-buffer (djvu-ref read-buf doc)
-    (cond ((and djvu-image-mode (djvu-ref dpos doc)))
+    (cond ((and djvu-image-mode
+                (djvu-ref read-pos doc)))
           ((= (point-min) (point-max))
            ;; An empty djvu page gives us something like (page 0 0 0 0 "")
            ;; Take the center of an empty page
@@ -2108,7 +2186,7 @@ This is either a list (XMIN YMIN XMAX YMAX) or (X Y)."
                  (/ (cdr (djvu-ref pagesize doc)) 2)))
           (t
            (unless point
-             (setq point (if djvu-image-mode (point-min) (point))))
+             (setq point (point)))
            ;; Things get rather complicated if the text does not contain
            ;; separate words.
            (or (get-text-property point 'word)
@@ -2123,69 +2201,88 @@ This is either a list (XMIN YMIN XMAX YMAX) or (X Y)."
                      (/ (cdr (djvu-ref pagesize doc)) 2)))))))
 
 (defun djvu-mean-dpos (dpos)
-  "For Djvu position DPOS return mean coordinates (X Y)."
-  ;; This works both for DPOS being vectors and lists.
+  "For Djvu position DPOS return mean coordinates (X Y).
+DPOS is a list or vector (XMIN YMIN XMAX YMAX)."
   (if (elt dpos 2)
       (list (/ (+ (elt dpos 0) (elt dpos 2)) 2)
             (/ (+ (elt dpos 1) (elt dpos 3)) 2))
     dpos))
 
+(defsubst djvu-dist (width height)
+  (+ (* width width) (* height height)))
+
 (defun djvu-goto-dpos (object dpos)
   "Go to OBJECT at position DPOS in the text or annotation buffer.
 If found, return corresponding buffer position.
-Otherwise, go to beginning of buffer and return nil."
+Otherwise, do nothing and return nil."
   ;; This code relies on the fact that we have all coordinates
   ;; in the format (xmin ymin xmax ymax) instead of the format
   ;; (xmin ymin width height) used by djvused for maparea annotations.
-  (goto-char (point-min))
-  (or (and (elt dpos 2)
-           (re-search-forward (concat "\\<" (symbol-name object) "\\>[ \t\n]+"
-                                      (mapconcat 'number-to-string dpos "[ \t\n+]")
-                                      "\\( +\"\\)?") nil t))
-      (let* ((re (concat "\\<" (symbol-name object) "\\> +"
-                         (mapconcat 'identity
-                                    (make-list 4 "\\([[:digit:]]+\\)") " +")
-                         "\\( +\"\\)?"))
-             (dpos (djvu-mean-dpos dpos))
-             (x (nth 0 dpos))
-             (y (nth 1 dpos))
-             done)
-        (goto-char (point-min))
-        (while (and (not done)
-                    (re-search-forward re nil t))
-          (let ((x1 (djvu-match-number 1))
-                (x2 (djvu-match-number 3))
-                (y1 (djvu-match-number 2))
-                (y2 (djvu-match-number 4)))
-            (setq done (and (<= x1 x x2)
-                            (<= y1 y y2)))))
-        (if done (point)
-          (goto-char (point-min))
-          nil))))
+  (cond ((not dpos) nil) ; DPOS is nil, do nothing, return nil
 
-(defsubst djvu-dist (width height)
-  (+ (* width width) (* height height)))
+        ((elt dpos 2) ; DPOS is a list or vector (XMIN YMIN XMAX YMAX)
+         (goto-char (point-min))
+         (or (re-search-forward (format "\\<%s\\>[ \t\n]+%s\\([ \t\n]+\"\\)?"
+                                        object
+                                        (mapconcat 'number-to-string dpos
+                                                   "[ \t\n]+"))
+                                nil t)
+             ;; try again, using the mean value of DPOS
+             (djvu-goto-dpos object (djvu-mean-dpos dpos))))
+
+        (t ; DPOS is a list (X Y)
+         ;; Look for OBJECT with either
+         ;; - DPOS inside OBJECT -> exact match
+         ;; - OBJECT nearest to DPOS -> approximate match
+         ;; The latter always succeeds.
+         (let* ((re (format "\\<%s\\>[ \t\n]+%s\\([ \t\n]+\"\\)?"
+                            object
+                            (mapconcat 'identity
+                                       (make-list 4 "\\([[:digit:]]+\\)")
+                                       "[ \t\n]+")))
+                (x (nth 0 dpos)) (y (nth 1 dpos))
+                (x2 (- (* 2 x))) (y2 (- (* 2 y)))
+                (good-dist (* 4 (djvu-dist (car (djvu-ref pagesize))
+                                           (cdr (djvu-ref pagesize)))))
+                (good-pnt (point-min))
+                pnt dist)
+           (goto-char (point-min))
+           (while (and (not (zerop good-dist))
+                       (setq pnt (re-search-forward re nil t)))
+             (let ((xmin (djvu-match-number 1)) (ymin (djvu-match-number 2))
+                   (xmax (djvu-match-number 3)) (ymax (djvu-match-number 4)))
+               (if (and (<= xmin x xmax) (<= ymin y ymax))
+                   (setq good-dist 0 good-pnt pnt) ; exact match
+                 (setq dist (djvu-dist (+ xmin xmax x2) (+ ymin ymax y2)))
+                 (if (< dist good-dist)
+                     (setq good-pnt pnt good-dist dist))))) ; approximate match
+           (goto-char good-pnt)
+           (if (/= good-pnt (point-min)) good-pnt)))))
 
 (defun djvu-goto-read (&optional dpos)
   "Go to buffer position in Read buffer corresponding to Djvu position DPOS.
 Return corresponding buffer position."
-  (unless dpos (setq dpos (djvu-ref dpos)))
   (with-current-buffer (djvu-ref read-buf)
-    (goto-char (point-min))
-    (cond ((not dpos) nil) ; DPOS is nil, do nothing, return nil
+    (cond (djvu-image-mode
+           (djvu-set read-pos dpos)
+           (point-min))
+          ((not dpos) nil) ; DPOS is nil, do nothing, return nil
 
-          ((elt dpos 2) ; DPOS is a list (XMIN YMIN XMAX YMAX)
+          ((elt dpos 2) ; DPOS is a list or vector (XMIN YMIN XMAX YMAX)
            ;; Go to the buffer position of the first word inside DPOS.
            (let ((pnt (point-min))
                  (xmin (elt dpos 0)) (ymin (elt dpos 1))
                  (xmax (elt dpos 2)) (ymax (elt dpos 3))
                  word done)
-             (while (if (and (setq word (djvu-mean-dpos
-                                         (get-text-property pnt 'word)))
-                             (<= xmin (nth 0 word)) (<= (nth 0 word) xmax)
-                             (<= ymin (nth 1 word)) (<= (nth 1 word) ymax))
-                        (not (setq done t)) ; terminate successfully
-                      (setq pnt (next-single-property-change pnt 'word))))
+             (goto-char (point-min))
+             (while (progn ; Do while
+                      (setq done
+                            (and (setq word (djvu-mean-dpos
+                                             (get-text-property pnt 'word)))
+                                 (<= xmin (nth 0 word) xmax)
+                                 (<= ymin (nth 1 word) ymax)))
+                      (and (not done)
+                           (setq pnt (next-single-property-change pnt 'word)))))
              (if done
                  (goto-char pnt)
                ;; try again, using the mean value of DPOS
@@ -2195,23 +2292,27 @@ Return corresponding buffer position."
            ;; Look for word with either
            ;; - DPOS inside word -> exact match
            ;; - word nearest to DPOS -> approximate match
-           (let ((hpos (nth 0 dpos)) (vpos (nth 1 dpos))
-                 (good-dist (djvu-dist (car (djvu-ref pagesize))
-                                       (cdr (djvu-ref pagesize))))
-                 (pnt (point-min)) (good-pnt (point-min))
-                 word dist)
-             (while (progn
+           ;; The latter always succeeds.
+           (let* ((x (nth 0 dpos)) (y (nth 1 dpos))
+                  (x2 (- (* 2 x))) (y2 (- (* 2 y)))
+                  (good-dist (* 4 (djvu-dist (car (djvu-ref pagesize))
+                                             (cdr (djvu-ref pagesize)))))
+                  (pnt (point-min)) (good-pnt (point-min))
+                  word dist)
+             (goto-char (point-min))
+             (while (progn ; Do while
                       (when (setq word (get-text-property pnt 'word))
-                        (if (and (<= (aref word 0) hpos (aref word 2))
-                                 (<= (aref word 1) vpos (aref word 3)))
+                        (if (and (<= (aref word 0) x (aref word 2))
+                                 (<= (aref word 1) y (aref word 3)))
                             (setq good-dist 0 good-pnt pnt) ; exact match
-                          (setq dist (djvu-dist (- (/ (+ (aref word 0) (aref word 2)) 2) hpos)
-                                                (- (/ (+ (aref word 1) (aref word 3)) 2) vpos)))
+                          (setq dist (djvu-dist (+ (aref word 0) (aref word 2) x2)
+                                                (+ (aref word 1) (aref word 3) y2)))
                           (if (< dist good-dist)
                               (setq good-pnt pnt good-dist dist)))) ; approximate match
                       (and (not (zerop good-dist))
                            (setq pnt (next-single-property-change pnt 'word)))))
-             (goto-char good-pnt))))))
+             (goto-char good-pnt)
+             (if (/= good-pnt (point-min)) good-pnt))))))
 
 ;;; Djvu Annotation mode
 
@@ -2416,8 +2517,6 @@ Interactively, the command `djvu-mouse-text-area' in `djvu-image-mode'
 is usually easier to use."
   (interactive (djvu-interactive-text-area))
   (setq area (djvu-bound-area area))
-  ;; Record position where annotation was made.
-  (djvu-set dpos (djvu-mean-dpos area))
   (with-current-buffer (djvu-ref annot-buf)
     (goto-char (point-max))
     (insert (format "(maparea %S\n %S\n "
@@ -2483,7 +2582,7 @@ With prefix LEFT mark left of beginning of line."
   (let ((dpos (djvu-dpos))
         (doc djvu-doc))
     (with-current-buffer (djvu-ref annot-buf doc)
-      (if (and dpos (djvu-goto-dpos 'rect dpos))
+      (if (djvu-goto-dpos 'rect dpos)
           (djvu-update-url-internal url color opacity border)
         (user-error "No object to update")))))
 
@@ -2609,22 +2708,13 @@ these elements are merged into one."
           (pop areas)))))
   areas)
 
-(defvar djvu-rect-area-nodups nil
-  "If non-nil `djvu-rect-area' does not create multiple rects for same areas.")
-
 (defun djvu-rect-area (url comment rects &optional color opacity border)
   "Using URL and COMMENT, highlight RECTS.
 The elements in the list RECTS are 4-element sequences of coordinates
 each defining a rect area for djvused."
-  (setq rects (mapcar 'djvu-bound-area (djvu-merge-areas rects)))
-  ;; Record position where annotation was made.
-  (let ((posl (mapcar 'djvu-mean-dpos rects))
-        (n (length rects)))
-    (djvu-set dpos (list (/ (apply '+ (mapcar 'car posl)) n)
-                         (/ (apply '+ (mapcar 'cadr posl)) n))))
   (setq rects (mapcar (lambda (rect) (apply 'format "(rect %d %d %d %d)"
-                                            rect))
-                      rects))
+                                            (djvu-bound-area rect)))
+                      (djvu-merge-areas rects)))
   ;; Insert in Annotations buffer.
   (with-current-buffer (djvu-ref annot-buf)
     (unless (and djvu-rect-area-nodups
@@ -2934,8 +3024,8 @@ file SCRIPT.  DOC defaults to the current Djvu document."
         (djvu-convert-hash t)
         (write-region nil nil script t 0) ; append to SCRIPT
         ;; It is not all correct to ignore rect-list for shared
-        ;; annotations.  It should really go into a separate slot
-        ;; shared-rect-list of djvu-doc, so that then we can merge
+        ;; annotations.  It should really go into a separate variable
+        ;; `djvu-doc-shared-rect-list', so that then we can merge
         ;; these for all pages.
         (unless shared
           (djvu-set rect-list (apply 'nconc rect-list) doc))))))
@@ -3037,9 +3127,9 @@ Return nil if no such object can be found."
   (let ((dpos (djvu-dpos))
         (doc djvu-doc))
     (with-current-buffer (djvu-ref annot-buf doc)
-      (if (and dpos (djvu-goto-dpos 'rect dpos))
+      (if (djvu-goto-dpos 'rect dpos)
           (djvu-update-color-internal color)
-        (error "No object to update")))))
+        (user-error "No object to update")))))
 
 (defun djvu-update-color-internal (color)
   "Update color attribute of Djvu maparea to COLOR.
@@ -3383,11 +3473,6 @@ file SCRIPT. DOC defaults to the current Djvu document."
 
 ;;; Image minor mode
 
-;; The image slot of `djvu-doc' is a list:
-;; the first element is the page number corresponding to the image,
-;; the second element is the magnification
-;; the remaining elements specify the image itself.
-
 (defmacro djvu-with-event-buffer (event &rest body)
   "With buffer of EVENT current, evaluate BODY."
   (declare (indent 1))
@@ -3431,7 +3516,16 @@ file SCRIPT. DOC defaults to the current Djvu document."
             ;;
             ("+" . djvu-image-zoom-in)
             ("-" . djvu-image-zoom-out))
-  (djvu-image))
+  (if (and djvu-image-mode
+           (not (get-text-property (point-min) 'display)))
+      ;; Remember DPOS if we enable `djvu-image-mode'.
+      (djvu-set read-pos (let (djvu-image-mode)
+                           (djvu-read-dpos))))
+  (let ((tmp (and (not djvu-image-mode)
+                  (get-text-property (point-min) 'display))))
+    (djvu-image)
+    ;; Go to DPOS if we disable `djvu-image-mode'.
+    (if tmp (djvu-goto-read (djvu-ref read-pos)))))
 
 (defun djvu-image (&optional isize)
   "If `djvu-image-mode' is enabled, display image of current Djvu page.
@@ -3441,13 +3535,9 @@ Otherwise remove the image."
   ;; in particular, for the "bare" calls of `djvu-image' by
   ;; `djvu-image-zoom-in' and `djvu-image-zoom-out'.
   (if (not djvu-image-mode)
-      (let (buffer-read-only)
-        (remove-text-properties (point-min) (point-max) '(display nil))
-        (djvu-goto-read))
-    (unless (get-text-property (point-min) 'display)
-      ;; Remember buffer position
-      (let (djvu-image-mode)
-        (djvu-set dpos (djvu-read-dpos))))
+      (if (get-text-property (point-min) 'display)
+          (let (buffer-read-only)
+            (remove-text-properties (point-min) (point-max) '(display nil))))
     ;; Update image if necessary.
     (if (or (not (eq (djvu-ref page) (car (djvu-ref image))))
             (and isize
@@ -3593,11 +3683,14 @@ Otherwise remove the image."
          (_ (if (equal size '(0 . 0))
                 (error "See Emacs bug#18839 (GNU Emacs 24.4)")))
          (width  (/ (float (car (djvu-ref pagesize))) (car size)))
-         (height (/ (float (cdr (djvu-ref pagesize))) (cdr size))))
-    (list (round (* (if sorted (min x1 x2) x1) width))
-          (round (* (- (cdr size) (if sorted (max y1 y2) y1)) height))
-          (round (* (if sorted (max x1 x2) x2) width))
-          (round (* (- (cdr size) (if sorted (min y1 y2) y2)) height)))))
+         (height (/ (float (cdr (djvu-ref pagesize))) (cdr size)))
+         (area
+          (list (round (* (if sorted (min x1 x2) x1) width))
+                (round (* (- (cdr size) (if sorted (max y1 y2) y1)) height))
+                (round (* (if sorted (max x1 x2) x2) width))
+                (round (* (- (cdr size) (if sorted (min y1 y2) y2)) height)))))
+    (djvu-set read-pos (djvu-mean-dpos area))
+    area))
 
 (defun djvu-mouse-rect-area (event)
   (interactive "e")
@@ -3659,7 +3752,6 @@ Otherwise remove the image."
 
 (defun djvu-line-area (url text line &optional border arrow width lineclr)
   ;; Record position where annotation was made.
-  (djvu-set dpos (djvu-mean-dpos line))
   (with-current-buffer (djvu-ref annot-buf)
     (goto-char (point-max))
     ;; It seems that TEXT is ignored by djview.
@@ -3841,7 +3933,8 @@ This uses the command \"djvused doc.djvu -e ls\"."
         (erase-buffer)
         (djvu-djvused doc t "-e" "ls"))
       (set-buffer-modified-p nil)
-      (setq buffer-read-only t))
+      (setq buffer-read-only t)
+      (goto-char (point-min)))
     (pop-to-buffer buffer)))
 
 ;;;###autoload
@@ -3917,6 +4010,65 @@ With prefix OUTLINE non-nil remove Outline, too."
                           (if outline " set-outline;\n." ""))
                   "-s")
     (djvu-init-page nil doc)))
+
+;;;; Emacs bookmark integration (inspired by doc-view.el)
+
+(declare-function bookmark-make-record-default "bookmark"
+                  (&optional no-file no-context posn))
+(declare-function bookmark-prop-get "bookmark" (bookmark prop))
+(declare-function bookmark-get-filename "bookmark" (bookmark))
+(declare-function bookmark-get-front-context-string "bookmark" (bookmark))
+(declare-function bookmark-get-rear-context-string "bookmark" (bookmark))
+(declare-function bookmark-get-position "bookmark" (bookmark))
+
+(defun djvu-bookmark-make-record ()
+  (nconc (bookmark-make-record-default)
+         `((page . ,(djvu-ref page))
+           (d-buffer . ,djvu-buffer)
+           (handler . djvu-bookmark-handler))))
+
+;; Adapted from `bookmark-default-handler'.
+;;;###autoload
+(defun djvu-bookmark-handler (bmk)
+  "Handler to jump to a particular bookmark location in a djvu document.
+BMK is a bookmark record, not a bookmark name (i.e., not a string).
+Changes current buffer and point and returns nil, or signals a `file-error'."
+  (let ((file          (bookmark-get-filename bmk))
+	(buf           (bookmark-prop-get bmk 'buffer))
+        (d-buffer      (bookmark-prop-get bmk 'd-buffer))
+        (page          (bookmark-prop-get bmk 'page))
+        (forward-str   (bookmark-get-front-context-string bmk))
+        (behind-str    (bookmark-get-rear-context-string bmk))
+        (pos           (bookmark-get-position bmk)))
+    (set-buffer
+     (cond
+      ((and file (file-readable-p file) (not (buffer-live-p buf)))
+       (find-file-noselect file))
+      ;; No file found.  See if buffer BUF has been created.
+      ((and buf (get-buffer buf)))
+      (t ;; If not, raise error.
+       (signal 'bookmark-error-no-filename (list 'stringp file)))))
+    (if page (djvu-goto-page page))
+    (if d-buffer
+        (set-buffer
+         (pcase d-buffer
+           (`read (djvu-ref read-buf))
+           (`text (djvu-ref text-buf))
+           (`annot (djvu-ref annot-buf))
+           (`shared (djvu-ref shared-buf))
+           (`bookmarks (djvu-ref bookmarks-buf))
+           (`outline (djvu-ref outline-buf)))))
+    (if pos (goto-char pos))
+    ;; Go searching forward first.  Then, if forward-str exists and
+    ;; was found in the file, we can search backward for behind-str.
+    ;; Rationale is that if text was inserted between the two in the
+    ;; file, it's better to be put before it so you can read it,
+    ;; rather than after and remain perhaps unaware of the changes.
+    (when (and forward-str (search-forward forward-str (point-max) t))
+      (goto-char (match-beginning 0)))
+    (when (and behind-str (search-backward behind-str (point-min) t))
+      (goto-char (match-end 0)))
+    nil))
 
 
 (provide 'djvu)
