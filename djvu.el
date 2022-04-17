@@ -1,10 +1,10 @@
 ;;; djvu.el --- Edit and view Djvu files via djvused -*- lexical-binding: t -*-
 
-;; Copyright (C) 2011-2020  Free Software Foundation, Inc.
+;; Copyright (C) 2011-2022  Free Software Foundation, Inc.
 
 ;; Author: Roland Winkler <winkler@gnu.org>
 ;; Keywords: files, wp
-;; Version: 1.1.1
+;; Version: 1.1.2
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -139,6 +139,18 @@
 
 ;;; News:
 
+;; v1.1.2:
+;; - Support changing the mode of a buffer visiting a Djvu document.
+;;
+;; - Support `doc-view-toggle-display' with `major-mode-suspend'.
+;;
+;; - Selecting the background color "transparent" removes the
+;;   background color attribute.
+;;
+;; - New options `djvu-image-zoom' and `djvu-ascenders-re'.
+;;
+;; - Bug fixes.
+;;
 ;; v1.1.1:
 ;; - Support text and image scrolling similar to `doc-view-mode'.
 ;;   New option `djvu-continuous'.
@@ -204,20 +216,20 @@
 
 ;;; Djvu internals (see Sec. 8.3.4.2.3.1 of djvu3spec.djvu)
 ;;
-;; Supported area attributes             rect  oval  poly  line  text
+;; Supported area attributes             rect  text  oval  line  poly
 ;; (none)/(xor)/(border c)                X     X     X     X     X
 ;; (shadow_* t)                           X
-;; (border_avis)                          X     X     X
+;; (border_avis)                          X           X           X
 ;; (hilite color) / (opacity o)           X
 ;; (arrow) / (width w) / (lineclr c)                        X
-;; (backclr c) / (textclr c) / (pushpin)                          X
+;; (backclr c) / (textclr c) / (pushpin)        X
 ;;
 ;; c = #RRGGBB   t = thickness (1..32)
 ;; o = opacity = 0..200 (yes)
 ;;
 ;; zones: page, column, region, para, line, word, and char
+;; areas: rect, text, oval, line, and poly
 
-(require 'button)
 (require 'image-mode)
 (eval-when-compile
   (require 'cl-lib))
@@ -263,8 +275,9 @@
     ("magenta" . "#FF00FF") ; 5
     ("purple"  . "#7F60FF") ; 6
     ("cyan"    . "#00FFFF") ; 7
-    ("white"   . "#FFFFFF") ; 8
-    ("black"   . "#000000")); 9
+    ("pink"    . "#FF6060") ; 8
+    ("white"   . "#FFFFFF") ; 9
+    ("black"   . "#000000")); 10
   "Alist of colors for highlighting."
   :group 'djvu
   :type '(repeat (cons (string) (string))))
@@ -362,6 +375,11 @@ Used by `djvu-region-string'."
   :group 'djvu
   :type 'boolean)
 
+(defcustom djvu-image-zoom 1.2
+  "Zoom factor for images."
+  :group 'djvu
+  :type 'number)
+
 (defcustom djvu-descenders-re "[(),;Qgjpqy]" ; some fonts also `J' and `f'
   ;; https://en.wikipedia.org/wiki/Descender
   "Regexp matching any descending characters or nil.
@@ -374,7 +392,40 @@ slightly below the baseline."
   :group 'djvu
   :type '(choice regexp (const nil)))
 
+(defcustom djvu-ascenders-re "[^-,.;:acegm-su-z\s]"
+  "Regexp matching ascending characters or nil, see `djvu-descenders-re'."
+  :group 'djvu
+  :type '(choice regexp (const nil)))
+
 ;; Internal variables
+
+(defvar djvu-coords-re
+  (format "\\(?2:%s\\)"
+          (mapconcat (lambda (i) (format "\\(?%d:-?[0-9]+\\)" i))
+                     '(3 4 5 6) "[\s\t]+"))
+  "Regexp matching the coordinates of Djvu areas and zones.
+Substring 2: coordinates, 3-6: individual coordinates.")
+
+(defvar djvu-coord-xy-re
+  (mapconcat (lambda (i) (format "\\(?%d:-?[0-9]+\\)" i))
+             '(1 2) "[\s\t]+")
+  "Regexp matching pair of xy coordinates of Djvu maparea poly.
+Substrings 1-2: individual coordinates.")
+
+(defvar djvu-area-re
+  (format "(\\(?1:%s\\)[\s\t]+%s[)\s\t\n]"
+          (regexp-opt '("rect" "oval" "text" "line" "poly"))
+          djvu-coords-re)
+  "Regexp matching a Djvu area.
+Substring 1: area type, 2: coordinates, 3-6: individual coordinates.")
+
+(defvar djvu-zone-re
+  (format "[\s\t]*(\\(?1:%s\\)[\s\t]+%s[\s\t\n]+" ; omit closing `)'
+          (regexp-opt '("page" "column" "region" "para" "line"
+                        "word" "char"))
+           djvu-coords-re)
+  "Regexp matching the beginning of a Djvu text zone.
+Substring 1: zone type, 2: coordinates, 3-6: individual coordinates.")
 
 (defvar djvu-test nil
   "If non-nil do not process / delete djvused scripts.  Useful for testing.")
@@ -407,6 +458,31 @@ Bind this with `let' to select one of these schemes.")
   "Counter for bookmark level.")
 
 (defvar djvu-image-mode) ; fully defined by `define-minor-mode' (buffer-local)
+
+(defvar djvu-init nil
+  "Non-nil during initialization of Djview mode.")
+
+(defvar djvu-color-attributes '(border hilite lineclr backclr textclr)
+  "List of color attributes known to Djvu.  See djvused(1).")
+
+(defvar djvu-color-re
+  (concat "(" (regexp-opt (mapcar #'symbol-name djvu-color-attributes) t)
+          "[ \t\n]+\\(%s\\(%s[[:xdigit:]][[:xdigit:]]"
+          "[[:xdigit:]][[:xdigit:]][[:xdigit:]][[:xdigit:]]\\)%s\\)[ \t\n]*)")
+  "Format string to create a regular expression matching color attributes.")
+
+(defvar djvu-beg-object-re
+  (concat "^[\s\t]*(" (regexp-opt '("background" "zoom" "mode" "align"
+                                    "maparea" "metadata" "xmp" "bookmarks")
+                                  t)
+          "\\>")
+  "Regexp matching the beginning of a Djvu object.  See djvused(1).")
+
+(defvar djvu-last-search-re nil
+  "Last regexp used by `djvu-re-search-forward'.")
+
+(defvar djvu-modified nil
+  "Let-bound in `djvu-mouse-drag-track-area'.")
 
 ;; See `ediff-defvar-local'
 (defmacro djvu-defvar-local (var &optional val doc)
@@ -486,6 +562,12 @@ Used in `djvu-image-mode' when we cannot go to this position.")
 (defvar-local djvu-doc-image nil
   "Image of current page of a Djvu document.
 This is a list (PAGE-NUM MAGNIFICATION IMAGE).")
+
+(defvar-local djvu-doc-image-hscroll 0
+  "Number of columns by which a page image is scrolled from left margin.")
+
+(defvar-local djvu-doc-image-vscroll 0
+  "Amount by which a page image is scrolled vertically.")
 
 ;;; Helper functions and macros
 
@@ -639,12 +721,10 @@ Preserve FILE if `djvu-test' is non-nil."
 (defun djvu-scroll-up-command (&optional arg)
   "Scroll text upward ARG lines; or near full screen if no ARG.
 At the bottom of the page, when `djvu-continuous' is non-nil
-or prefix ARG is nil, go to the next page.
-Prefix ARG may take the same values as arg ARG of `scroll-up-command'.
-For historical reasons, this includes the range of values
-of `current-prefix-arg'."
+go to the next page.
+Prefix ARG may take the same values as arg ARG of `scroll-up-command'."
   (interactive "^P") ; same as `scroll-up-command'
-  (if (and (or djvu-continuous (not arg))
+  (if (and djvu-continuous
            (= (window-end) (point-max))
            (< (djvu-ref page) (djvu-ref pagemax)))
       (djvu-next-page 1)
@@ -655,12 +735,10 @@ of `current-prefix-arg'."
 (defun djvu-scroll-down-command (&optional arg)
   "Scroll text downward ARG lines; or near full screen if no ARG.
 At the top of the page, when `djvu-continuous' is non-nil
-or prefix ARG is nil, go to the previous page.
-Prefix ARG may take the same values as arg ARG of `scroll-down-command'.
-For historical reasons, this includes the range of values
-of `current-prefix-arg'."
+go to the previous page.
+Prefix ARG may take the same values as arg ARG of `scroll-down-command'."
   (interactive "^P") ; same as `scroll-down-command'
-  (if (and (or djvu-continuous (not arg))
+  (if (and djvu-continuous
            (= (point-min) (window-start))
            (< 1 (djvu-ref page)))
       (progn
@@ -725,11 +803,6 @@ go to the previous page."
     (djvu-goto-page (car history-forward))
     (djvu-set history-forward (cdr history-forward))))
 
-(defun djvu-set-color-highlight (color)
-  "Set color for highlighting based on `djvu-color-alist'."
-  (interactive (list (completing-read "Color: " djvu-color-alist nil t)))
-  (setq djvu-color-highlight color))
-
 (defun djvu-kill-view (&optional doc all)
   "Kill most recent Djview process for DOC.
 If ALL is non-nil, kill all Djview processes."
@@ -751,7 +824,7 @@ This relies on `djvu-kill-doc-all' for doing the real work."
   (interactive)
   ;; `djvu-kill-doc-all' will try to save our work and kill all djview
   ;; processes.
-  (mapc 'kill-buffer (djvu-buffers doc)))
+  (mapc #'kill-buffer (djvu-buffers doc)))
 
 (defvar djvu-in-kill-doc nil
   "Non-nil if we are running `djvu-kill-doc-all'.")
@@ -769,14 +842,30 @@ so that killing the current buffer kills all buffers visiting `djvu-doc'."
       (condition-case nil
           (let ((doc djvu-doc))
             (setq buffers (djvu-buffers doc))
-            (unless (memq nil (mapcar 'buffer-live-p buffers))
+            (unless (memq nil (mapcar #'buffer-live-p buffers))
                 (djvu-save doc t))
             (djvu-kill-view doc t))
         (error nil))
       ;; A function in `kill-buffer-hook' should not kill the buffer
       ;; for which we called this hook in the first place, so that
       ;; other functions in this hook can do their job, too.
-      (mapc 'kill-buffer (delq (current-buffer) buffers)))))
+      (mapc #'kill-buffer (delq (current-buffer) buffers)))))
+
+(defun djvu-change-major-mode ()
+  "Clean up Djvu mode buffers and hooks.
+Djvu mode puts this into `change-major-mode-hook'."
+  (unless djvu-init
+    (djvu-kill-doc-all)
+    ;; These local variables are permanent local
+    (kill-local-variable 'kill-buffer-hook)
+    (kill-local-variable 'djvu-doc)
+    (kill-local-variable 'revert-buffer-function)
+    (kill-local-variable 'write-file-functions)
+    (let ((inhibit-read-only t)
+          (buffer-undo-list t))
+      (insert-file-contents-literally buffer-file-name t nil nil t))
+    (setq buffer-undo-list nil
+          buffer-read-only (not (file-writable-p buffer-file-name)))))
 
 (defun djvu-save (&optional doc query)
   "Save Djvu DOC."
@@ -802,7 +891,8 @@ so that killing the current buffer kills all buffers visiting `djvu-doc'."
       (if (and annot-modified (not text-modified))
           (djvu-init-read (djvu-read-text doc) doc))
       (djvu-all-buffers doc
-        (set-buffer-modified-p nil)))))
+        (set-buffer-modified-p nil))))
+  t) ; for `write-file-function'
 
 (defun djvu-modified ()
   "Mark Djvu Read and Outline buffers as modified if necessary.
@@ -891,15 +981,6 @@ the purpose of calling djvused is to update the Djvu file."
               (djvu-all-buffers doc
                 (setq buffer-file-number file-number)))))))))
 
-(defvar djvu-color-attributes '(border hilite lineclr backclr textclr)
-  "List of color attributes known to Djvu.")
-
-(defvar djvu-color-re
-  (concat "(" (regexp-opt (mapcar 'symbol-name djvu-color-attributes) t)
-          "[ \t\n]+\\(%s\\(%s[[:xdigit:]][[:xdigit:]]"
-          "[[:xdigit:]][[:xdigit:]][[:xdigit:]][[:xdigit:]]\\)%s\\)[ \t\n]*)")
-  "Format string to create a regular expression matching color attributes.")
-
 ;; The Emacs lisp reader gets confused by the Djvu color syntax with
 ;; symbols '#000000.  So we temporarily convert these symbols to strings.
 (defun djvu-convert-hash (&optional reverse)
@@ -961,17 +1042,32 @@ If INITIAL-INPUT is non-nil use string from REGION as initial input."
 (defun djvu-interactive-color (color)
   "Return color specification for use in interactive calls.
 The color is the Nth element of `djvu-color-alist'.
-Here N is `current-prefix-arg' if this is a number.
+Here N is `current-prefix-arg' if this is a non-negative number.
 N is 1 - `current-prefix-arg' / 4 if the prefix is a cons,
 that is, `C-u' yields N = 0.
-Arg COLOR defines the default when there is no prefix arg."
+Arg COLOR defines the default when there is no prefix arg.
+Return nil if `current-prefix-arg' is a negative number.
+See also `djvu-interactive-color-read'."
   (let ((colnum (or (and (consp current-prefix-arg)
                          (1- (/ (car current-prefix-arg) 4)))
                     (and (integerp current-prefix-arg)
                          current-prefix-arg))))
-    (if (and colnum (>= colnum (length djvu-color-alist)))
-        (user-error "Color undefined"))
-    (if colnum (car (nth colnum djvu-color-alist)) color)))
+    (cond ((not colnum) color) ; use default
+          ((>= colnum (length djvu-color-alist))
+           (user-error "Color undefined"))
+          ((<= 0 colnum)
+           (car (nth colnum djvu-color-alist))))))
+
+(defun djvu-interactive-color-read ()
+  "Read color interactively.
+The return value is the car of an element of `djvu-color-alist'
+or nil if the user selects \"transparent\".
+See also `djvu-interactive-color'."
+  (let ((color (completing-read "New Color: "
+                                (cons '("transparent") djvu-color-alist )
+                                nil t)))
+     (unless (string= color "transparent")
+       color)))
 
 (defun djvu-page-url (&optional page dir doc)
   "For Djvu DOC return the internal url for PAGE.
@@ -981,9 +1077,9 @@ This is the inverse of `djvu-url-page'."
                       (cdr (assq page (djvu-ref page-id doc)))
                     page))))
 
-(defun djvu-interactive-url (&optional color)
+(defun djvu-interactive-url (color)
   "Return URL specification for use in interactive calls."
-  (let ((fmt (format "(%s) URL: " (or color djvu-color-url)))
+  (let ((fmt (format "(%s) URL: " (or color "no color")))
         val)
     (while (not val)
       (setq val (read-string fmt))
@@ -1007,28 +1103,29 @@ Return the new rgb color string.
 If BACKGROUND is nil, use `djvu-color-background'.
 If OPACITY is nil, use `djvu-opacity'.
 If INVERT is non-nil apply inverse transformation."
-  (let* ((color (if (string-match "\\`#" color) color
-                  (cdr (assoc color djvu-color-alist))))
-         (background (if (and background (string-match "\\`#" background))
-                         background
-                       (cdr (assoc (or background djvu-color-background)
-                                   djvu-color-alist))))
-         (a (/ (float (or opacity djvu-opacity)) 200)) ; foreground
-         (b (- 1 a))) ; background
-    (if invert
+  (when color
+    (let* ((color (if (string-match "\\`#" color) color
+                    (cdr (assoc color djvu-color-alist))))
+           (background (if (and background (string-match "\\`#" background))
+                           background
+                         (cdr (assoc (or background djvu-color-background)
+                                     djvu-color-alist))))
+           (a (/ (float (or opacity djvu-opacity)) 200)) ; foreground
+           (b (- 1 a))) ; background
+      (if invert
+          (cl-flet ((mix (beg end)
+                         (max 0 (min #xFF
+                                     (round (/ (- (djvu-substring-number color beg end 16)
+                                                  (* b (djvu-substring-number background beg end 16)))
+                                               a))))))
+            (format "#%02X%02X%02X"
+                    (mix 1 3) (mix 3 5) (mix 5 7)))
         (cl-flet ((mix (beg end)
                        (max 0 (min #xFF
-                       (round (/ (- (djvu-substring-number color beg end 16)
-                                    (* b (djvu-substring-number background beg end 16)))
-                                 a))))))
+                                   (round (+ (* a (djvu-substring-number color beg end 16))
+                                             (* b (djvu-substring-number background beg end 16))))))))
           (format "#%02X%02X%02X"
-                  (mix 1 3) (mix 3 5) (mix 5 7)))
-      (cl-flet ((mix (beg end)
-                     (max 0 (min #xFF
-                     (round (+ (* a (djvu-substring-number color beg end 16))
-                               (* b (djvu-substring-number background beg end 16))))))))
-        (format "#%02X%02X%02X"
-                (mix 1 3) (mix 3 5) (mix 5 7))))))
+                  (mix 1 3) (mix 3 5) (mix 5 7)))))))
 
 ;;; Djvu modes
 
@@ -1146,27 +1243,29 @@ This is a child of `special-mode-map'.")
 
 (define-derived-mode djvu-read-mode special-mode "Djview"
   "Mode for reading Djvu files."
-  ;; The Read buffer is not editable.  So do not create auto-save files.
-  (setq buffer-auto-save-file-name nil ; permanent buffer-local
-        djvu-buffer 'read
-        buffer-undo-list t)
-  (let ((fmt (concat (car (propertized-buffer-identification "%s"))
-                     "  p%d/%d")))
-    (setq mode-line-buffer-identification
-          `(24 (:eval (format ,fmt (buffer-name) (djvu-ref page)
-                              (djvu-ref pagemax))))))
-  (setq-local revert-buffer-function #'djvu-revert-buffer)
-  (setq-local bookmark-make-record-function #'djvu-bookmark-make-record)
-  (if (boundp 'mwheel-scroll-up-function) ; not --without-x build
-      (setq-local mwheel-scroll-up-function
-                  (lambda (&optional n)
-                    (if djvu-image-mode (djvu-image-scroll-up n)
-                      (djvu-scroll-up-command n)))))
-  (if (boundp 'mwheel-scroll-down-function)
-      (setq-local mwheel-scroll-down-function
-                  (lambda (&optional n)
-                    (if djvu-image-mode (djvu-image-scroll-down n)
-                      (djvu-scroll-down-command n))))))
+  (if (not djvu-init)
+      (djvu-init-mode) ; For `doc-view-toggle-display' and `major-mode-suspend'
+    ;; The Read buffer is not editable.  So do not create auto-save files.
+    (setq buffer-auto-save-file-name nil ; permanent buffer-local
+          djvu-buffer 'read
+          buffer-undo-list t)
+    (let ((fmt (concat (car (propertized-buffer-identification "%s"))
+                       "  p%d/%d")))
+      (setq mode-line-buffer-identification
+            `(24 (:eval (format ,fmt (buffer-name) (djvu-ref page)
+                                (djvu-ref pagemax))))))
+    (setq-local revert-buffer-function #'djvu-revert-buffer)
+    (setq-local bookmark-make-record-function #'djvu-bookmark-make-record)
+    (if (boundp 'mwheel-scroll-up-function) ; not --without-x build
+        (setq-local mwheel-scroll-up-function
+                    (lambda (&optional n)
+                      (if djvu-image-mode (djvu-image-scroll-up n)
+                        (djvu-scroll-up-command n)))))
+    (if (boundp 'mwheel-scroll-down-function)
+        (setq-local mwheel-scroll-down-function
+                    (lambda (&optional n)
+                      (if djvu-image-mode (djvu-image-scroll-down n)
+                        (djvu-scroll-down-command n)))))))
 
 (defvar djvu-script-mode-map
   (let ((km (make-sparse-keymap)))
@@ -1192,6 +1291,7 @@ This is a child of `special-mode-map'.")
     (define-key km "\C-c\C-q"    'djvu-quit-window)
     (define-key km "\C-c\C-k"    'djvu-kill-doc)
     (define-key km (kbd "C-c C-S-g") 'djvu-revert-buffer) ; [?\C-c ?\C-\S-g]
+
     km)
   "Keymap for Djvu Script Mode.
 This is a child of `lisp-mode-map'.")
@@ -1238,7 +1338,9 @@ This is a child of `lisp-mode-map'.")
                             "arrow" "width" "lineclr"
                             "backclr" "textclr" "pushpin"
                             "page" "column" "region" "para" "line"
-                            "word" "char") t) ")")
+                            "word" "char")
+                          t)
+              ")")
      1 font-lock-function-name-face)
     ;; url
     (djvu-font-lock-url))
@@ -1247,21 +1349,23 @@ This is a child of `lisp-mode-map'.")
 (define-derived-mode djvu-script-mode lisp-mode "Djvu Script"
   "Mode for editing Djvu scripts.
 The annotations, shared annotations and bookmark buffers use this mode."
-  ;; Fixme: we should create auto-save files for the script buffers.
-  ;; This requires suitable names for the auto-save files that should
-  ;; be derived from `buffer-file-name'.
-  (setq buffer-auto-save-file-name nil ; permanent buffer-local
-        fill-column djvu-fill-column
-        font-lock-defaults '(djvu-font-lock-keywords))
-  (let* ((fmt1 (car (propertized-buffer-identification "%s")))
-         (fmt2 (concat fmt1 "  p%d/%d")))
-    (setq mode-line-buffer-identification
-          `(24 (:eval (if djvu-doc
-                          (format ,fmt2 (buffer-name) (djvu-ref page)
-                                  (djvu-ref pagemax))
-                        (format ,fmt1 (buffer-name)))))))
-  (setq-local revert-buffer-function #'djvu-revert-buffer)
-  (setq-local bookmark-make-record-function #'djvu-bookmark-make-record))
+  (if (not djvu-init)
+      (djvu-init-mode) ; For `doc-view-toggle-display' and `major-mode-suspend'
+    ;; Fixme: we should create auto-save files for the script buffers.
+    ;; This requires suitable names for the auto-save files that should
+    ;; be derived from `buffer-file-name'.
+    (setq buffer-auto-save-file-name nil ; permanent buffer-local
+          fill-column djvu-fill-column
+          font-lock-defaults '(djvu-font-lock-keywords))
+    (let* ((fmt1 (car (propertized-buffer-identification "%s")))
+           (fmt2 (concat fmt1 "  p%d/%d")))
+      (setq mode-line-buffer-identification
+            `(24 (:eval (if djvu-doc
+                            (format ,fmt2 (buffer-name) (djvu-ref page)
+                                    (djvu-ref pagemax))
+                          (format ,fmt1 (buffer-name)))))))
+    (setq-local revert-buffer-function #'djvu-revert-buffer)
+    (setq-local bookmark-make-record-function #'djvu-bookmark-make-record)))
 
 (defvar djvu-outline-mode-map
   (let ((km (make-sparse-keymap)))
@@ -1322,30 +1426,33 @@ This is a child of `special-mode-map'.")
 
 (define-derived-mode djvu-outline-mode special-mode "Djvu OL"
   "Mode for reading the outline of Djvu files."
-  ;; The Outline buffer is not editable.  So do not create auto-save files.
-  (setq buffer-auto-save-file-name nil ; permanent buffer-local
-        djvu-buffer 'outline
-        buffer-undo-list t)
-  (let ((fmt (concat (car (propertized-buffer-identification "%s"))
-                     "  p%d/%d")))
-    (setq mode-line-buffer-identification
-          `(24 (:eval (format ,fmt (buffer-name) (djvu-ref page)
-                              (djvu-ref pagemax))))))
-  (setq-local revert-buffer-function #'djvu-revert-buffer)
-  (setq-local bookmark-make-record-function #'djvu-bookmark-make-record))
+  (if (not djvu-init)
+      (djvu-init-mode) ; For `doc-view-toggle-display' and `major-mode-suspend'
+    ;; The Outline buffer is not editable.  So do not create auto-save files.
+    (setq buffer-auto-save-file-name nil ; permanent buffer-local
+          djvu-buffer 'outline
+          buffer-undo-list t)
+    (let ((fmt (concat (car (propertized-buffer-identification "%s"))
+                       "  p%d/%d")))
+      (setq mode-line-buffer-identification
+            `(24 (:eval (format ,fmt (buffer-name) (djvu-ref page)
+                                (djvu-ref pagemax))))))
+    (setq-local revert-buffer-function #'djvu-revert-buffer)
+    (setq-local bookmark-make-record-function #'djvu-bookmark-make-record)))
 
 ;;; General Setup
 
 ;;;###autoload
-(add-to-list 'auto-mode-alist '("\\.djvu\\'" . djvu-dummy-mode))
+(add-to-list 'auto-mode-alist '("\\.djvu\\'" . djvu-init-mode))
 
 ;;;###autoload
-(defun djvu-dummy-mode ()
-  "Djvu dummy mode for `auto-mode-alist'."
+(defun djvu-init-mode ()
+  "Dummy mode for initializing Djvu mode.
+This can be used as an element for `auto-mode-alist'.
+This can also be used if the current buffer visits a Djvu file
+using some other mode."
+  (interactive)
   (djvu-find-file buffer-file-name nil nil t))
-
-;; FIXME: Add entry for `change-major-mode-hook'.
-;; How should this handle the plethora of buffers per djvu document?
 
 (defun djvu-read-file-name ()
   "Read file name of Djvu file.
@@ -1371,26 +1478,33 @@ from file."
   ;; Djvu mode needs a local file.  If FILE is located on a remote system,
   ;; you can use something like `file-local-copy' to edit FILE.
   (if (file-remote-p file)
-    (user-error "Cannot handle remote Djvu file `%s'" file))
+      (user-error "Cannot handle remote Djvu file `%s'" file))
   (unless (and (file-regular-p file)
                (file-readable-p file))
     (user-error "Cannot open Djvu file `%s'" file))
+  (with-temp-buffer
+    (insert-file-contents-literally file nil 0 4)
+    (goto-char (point-min))
+    (unless (looking-at "\\`AT&T") ; magic number for Djvu documents
+      (user-error "`%s' not a Djvu document" file)))
   (let* ((inhibit-quit t)
          (buf-basename (file-name-nondirectory file))
          (file-truename (abbreviate-file-name (file-truename file)))
          (file-number (nthcdr 10 (file-attributes file)))
          (dir (file-name-directory file))
          (read-only (not (file-writable-p file)))
-         (old-buf (if (equal buffer-file-truename file-truename)
-                      (current-buffer)
-                    (find-buffer-visiting file-truename)))
-         (doc (and old-buf (buffer-local-value 'djvu-doc old-buf)))
-         (old-bufs (and doc (mapcar 'buffer-live-p (djvu-buffers doc)))))
+         (doc (if (equal buffer-file-truename file-truename)
+                  (current-buffer)
+                (find-buffer-visiting file-truename)))
+         (old-bufs (and doc (buffer-local-value 'djvu-doc doc)
+                        (mapcar #'buffer-live-p (djvu-buffers doc))))
+         (djvu-init t))
     ;; Sanity check.  We should never need this.
     (when (and old-bufs (memq nil old-bufs))
       (message "Killing dangling Djvu buffers...")
-      (djvu-kill-doc doc)
-      (setq doc nil old-bufs nil)
+      (with-current-buffer doc
+        (djvu-kill-doc-all))
+      (setq old-bufs nil)
       (message "Killing dangling Djvu buffers...Done")
       (sit-for 2))
     ;; Do nothing if we are already visiting FILE such that all buffers
@@ -1420,18 +1534,22 @@ from file."
                          (concat buf-basename
                                  (nth n djvu-buffer-name-extensions))
                          dir))))
-          (if old-buf
+          (if doc
               ;; This applies if `find-file-noselect' created OLD-BUF
               ;; in order to visit FILE.  Hence recycle OLD-BUF as Read
-              ;; buffer so that `find-file-noselect' can do its job.
-              ;; FIXME: this ignores `djvu-buffer-name-extensions'
-              ;; because renaming OLD-BUF would break `uniquify'.
-              (with-current-buffer old-buf
+              ;; buffer.  This applies also if we switch from some other
+              ;; mode to Djview mode.
+              (with-current-buffer doc
                 (let ((inhibit-read-only t)
                       (buffer-undo-list t))
                   (erase-buffer))
                 (setq buffer-file-coding-system 'prefer-utf-8)
-                (setq doc old-buf))
+                ;; `rename-buffer' obeys uniquify.
+                (rename-buffer (concat buf-basename
+                                       (nth 0 djvu-buffer-name-extensions))
+                               t))
+            ;; We need this when mimicking `find-file'
+            ;; so that FILE does not yet have a buffer.
             (setq doc (fun 0)))
           (djvu-set read-buf doc doc)
           (djvu-set text-buf (fun 1) doc)
@@ -1469,21 +1587,26 @@ from file."
         (setq djvu-buffer 'bookmarks
               header-line-format '(:eval (djvu-header-line "bookmarks"))))
       (djvu-all-buffers doc
+        ;; permanent buffer-local variables
         (setq djvu-doc doc ; propagate DOC to all buffers
               buffer-file-name file
               ;; A non-nil value of `buffer-file-truename' enables file-locking,
               ;; see call of `lock_file' in `prepare_to_modify_buffer_1'
               buffer-file-truename file-truename
               buffer-file-number file-number
-              buffer-file-read-only read-only
+              default-directory dir)
+        ;; other buffer-local stuff
+        (setq buffer-file-read-only read-only
               ;; We assume that all buffers for a Djvu document have the same
               ;; read-only status.  Should we allow different values for the
-              ;; buffers of one document?  Or do we need a `djvu-read-only-mode'?
-              buffer-read-only read-only
-              default-directory dir)
+              ;; buffers of one document?
+              ;; Or do we need a `djvu-read-only-mode'?
+              buffer-read-only read-only)
+        (setq-local write-file-functions #'djvu-save)
         (set-visited-file-modtime)
-        (add-hook 'post-command-hook 'djvu-modified nil t)
-        (add-hook 'kill-buffer-hook 'djvu-kill-doc-all nil t))
+        (add-hook 'post-command-hook #'djvu-modified nil t)
+        (add-hook 'kill-buffer-hook #'djvu-kill-doc-all nil t)
+        (add-hook 'change-major-mode-hook #'djvu-change-major-mode nil t))
 
       (with-temp-buffer
         (djvu-djvused doc t "-e"
@@ -1548,6 +1671,7 @@ from file."
           (let ((object (read (current-buffer))))
             (with-current-buffer (djvu-ref bookmarks-buf doc)
               (let (buffer-read-only)
+                (erase-buffer)
                 (insert "(bookmarks")
                 (djvu-insert-bookmarks (cdr object) " ")
                 (insert ")\n")
@@ -1685,7 +1809,7 @@ into an undefined state."
                   (if page-id
                       (format "#%d" (car page-id))
                     (djvu-unresolve-url url))))
-               (t url))) ; some other URL
+               (t "#1"))) ; some other URL (possibly empty string)
         (t ; check whether URL can be resolved
          (cond ((string-match "\\`#[0-9]+\\'" url)
                 (if (assq (djvu-substring-number url 1)
@@ -1821,15 +1945,10 @@ If prefix NEW is non-nil, always create a new Djview process."
 
 ;;; Djvu Text mode
 
-(defvar djvu-last-search-re nil
-  "Last regexp used by `djvu-re-search-forward'.")
-
 (defun djvu-re-search-forward (regexp)
   "Search forward for match for REGEXP.
-
 Search case-sensitivity is determined by the value of the variable
 `case-fold-search', which see.
-
 The command `djvu-re-search-forward-continue' continues to search forward."
   (interactive "sSearch (regexp): ")
   (setq djvu-last-search-re regexp)
@@ -1996,7 +2115,7 @@ This command operates on the text buffer."
       (narrow-to-region beg end)
       (mapc (lambda (zone)
               (goto-char (point-min))
-              (let ((re (format ")[\n\t\s]+(%s -?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+" zone)))
+              (let ((re (format ")[\n\t\s]+(%s %s" zone djvu-coords-re)))
                 (while (re-search-forward re nil t)
                   (replace-match ""))))
             '("column" "region" "para" "line"))
@@ -2025,9 +2144,10 @@ This command operates on the text buffer."
   "Insert OBJECT into Djvu text buffer recursively using indentation INDENT."
   (when object
     (insert indent "("
-            (mapconcat 'prin1-to-string
+            (mapconcat #'prin1-to-string
                        (list (nth 0 object) (nth 1 object) (nth 2 object)
-                             (nth 3 object) (nth 4 object)) " "))
+                             (nth 3 object) (nth 4 object))
+                       " "))
     (let ((tail (nthcdr 5 object))
           (indent (concat indent " ")))
       (if (stringp (car tail))
@@ -2036,14 +2156,6 @@ This command operates on the text buffer."
           (insert "\n")
           (djvu-insert-text elt indent))
         (insert ")")))))
-
-(defvar djvu-zone-re
-  (concat "[ \t]*(\\("
-          (regexp-opt '("page" "column" "region" "para" "line"
-                        "word" "char"))
-          "\\)[ \t]+\\(\\(-?[0-9]+\\)[ \t]+\\(-?[0-9]+\\)"
-             "[ \t]+\\(-?[0-9]+\\)[ \t]+\\(-?[0-9]+\\)\\)[ \t\n]+")
-  "Regexp matching the beginning of a Djvu text zone.")
 
 (defun djvu-text-dpos (&optional point doc)
   "Return Djvu position of POINT in Djvu text buffer."
@@ -2056,7 +2168,7 @@ This command operates on the text buffer."
                         (bobp)))
           (forward-line -1))
         (if zone
-            (mapcar 'djvu-match-number '(3 4 5 6)))))))
+            (mapcar #'djvu-match-number '(3 4 5 6)))))))
 
 (defun djvu-read-text (&optional doc)
   "Read text of a Djvu document from text buffer."
@@ -2109,28 +2221,44 @@ If SCRIPT is non-nil, dump the text buffer into the djvused script file SCRIPT."
           (write-region nil nil script t 0))))) ; append to SCRIPT
 
 (defun djvu-text-zone (object depth zones)
-  "Evaluate zones for text OBJECT recursively."
-  (cond ((stringp (nth 5 object))
-         (aset zones depth (vector (nth 1 object) (nth 2 object)
-                                   (nth 3 object) (nth 4 object))))
-        (object
-         (let ((depth1 (1+ depth))
-               zone)
-           (aset zones depth nil)
-           (dolist (elt (nthcdr 5 object))
-             (djvu-text-zone elt depth1 zones)
-             (if (setq zone (aref zones depth))
-                 (let ((zone1 (aref zones depth1)))
-                   (aset zone 0 (min (aref zone 0) (aref zone1 0)))
-                   (aset zone 1 (min (aref zone 1) (aref zone1 1)))
-                   (aset zone 2 (max (aref zone 2) (aref zone1 2)))
-                   (aset zone 3 (max (aref zone 3) (aref zone1 3))))
-               (aset zones depth (copy-sequence (aref zones depth1)))))
-           (if (setq zone (aref zones depth))
-               (setcdr object (apply 'list (aref zone 0) (aref zone 1)
-                                     (aref zone 2) (aref zone 3)
-                                     (nthcdr 5 object)))
-             (error "No zone??"))))))
+  "Evaluate ZONES for text OBJECT recursively.
+This rearranges the tail of OBJECT destructively.
+Branches of OBJECT that point to empty strings are removed."
+  (if (stringp (nth 5 object))
+      ;; We set ZONES only if we have something nontrivial
+      (cond ((not (equal "" (nth 5 object)))
+             (aset zones depth (vector (nth 1 object) (nth 2 object)
+                                       (nth 3 object) (nth 4 object))))
+            ((zerop depth)
+             (setcdr object (list 0 0 0 0 ""))))
+    (let ((depth1 (1+ depth))
+          zone remove)
+      (aset zones depth nil)
+      (dolist (elt (nthcdr 5 object))
+        (aset zones depth1 nil)
+        (djvu-text-zone elt depth1 zones)
+        (let ((zone1 (aref zones depth1)))
+          (cond ((not zone1)
+                 ;; ELT has no ZONE1 because it points to an empty string.
+                 (push elt remove))
+                ((setq zone (aref zones depth))
+                 (aset zone 0 (min (aref zone 0) (aref zone1 0)))
+                 (aset zone 1 (min (aref zone 1) (aref zone1 1)))
+                 (aset zone 2 (max (aref zone 2) (aref zone1 2)))
+                 (aset zone 3 (max (aref zone 3) (aref zone1 3))))
+                (t (aset zones depth zone1)))))
+      (if remove
+          (let ((tail (nthcdr 4 object)))
+            (dolist (elt remove)
+              ;; `delq' removes all occurences of ELT from TAIL.
+              (setcdr tail (delq elt (cdr tail))))))
+      (cond ((setq zone (aref zones depth))
+             (setcdr object (append (mapcar #'identity zone)
+                                    (nthcdr 5 object))))
+            ((zerop depth)
+             (setcdr object (list 0 0 0 0 "")))
+            (t
+             (setcdr object nil))))))
 
 (defun djvu-script-buffer (buffer)
   "Return buffer for djvu script.
@@ -2155,6 +2283,7 @@ You get what you want."
     ;; Put this in a separate buffer!
     (with-current-buffer buffer
       (let ((buffer-undo-list t)
+            (djvu-init t)
             buffer-read-only)
         (djvu-script-mode)
         (erase-buffer)
@@ -2210,7 +2339,7 @@ BUFFER defaults to `djvu-script-buffer'.  If BUFFER is t, use current buffer."
         (djvu-goto-read dpos)))
     (set-buffer-modified-p nil)
     (setq buffer-read-only t)
-    (djvu-image)))
+    (if djvu-image-mode (djvu-image))))
 
 (defun djvu-insert-read (object)
   "Display text OBJECT recursively."
@@ -2260,7 +2389,11 @@ BUFFER defaults to `djvu-script-buffer'.  If BUFFER is t, use current buffer."
   (when djvu-last-rect
     (let ((beg (nth 0 djvu-last-rect))
           (end (nth 1 djvu-last-rect))
-          (face `(face (:background ,(nth 5 djvu-last-rect))
+          (face `(face (:background ,(nth 5 djvu-last-rect)
+                        ;; `make-button' puts a `button' overlay
+                        ;; that overrides :foreground.
+                        :foreground ,(readable-foreground-color
+                                      (nth 5 djvu-last-rect)))
                        help-echo ,(nth 4 djvu-last-rect))))
       (if (or (eq t djvu-read-prop-newline)
               (and (numberp djvu-read-prop-newline)
@@ -2335,7 +2468,7 @@ Otherwise, do nothing and return nil."
          (goto-char (point-min))
          (or (re-search-forward (format "\\<%s\\>[ \t\n]+%s\\([ \t\n]+\"\\)?"
                                         object
-                                        (mapconcat 'number-to-string dpos
+                                        (mapconcat #'number-to-string dpos
                                                    "[ \t\n]+"))
                                 nil t)
              ;; try again, using the mean value of DPOS
@@ -2348,7 +2481,7 @@ Otherwise, do nothing and return nil."
          ;; The latter always succeeds.
          (let* ((re (format "\\<%s\\>[ \t\n]+%s\\([ \t\n]+\"\\)?"
                             object
-                            (mapconcat 'identity
+                            (mapconcat #'identity
                                        (make-list 4 "\\([[:digit:]]+\\)")
                                        "[ \t\n]+")))
                 (x (nth 0 dpos)) (y (nth 1 dpos))
@@ -2427,10 +2560,6 @@ Return corresponding buffer position."
 
 ;;; Djvu Annotation mode
 
-(defvar djvu-annot-re
-  (concat "(" (regexp-opt '("background" "zoom" "mode" "align"
-                            "maparea" "metadata" "xmp") t) "\\>"))
-
 (defun djvu-init-annot (buf doc &optional shared)
   "Initialize Annotations buffer BUF of Djvu document DOC.
 SHARED should be non-nil for a Shared Annotations buffer."
@@ -2438,17 +2567,18 @@ SHARED should be non-nil for a Shared Annotations buffer."
   (goto-char (point-min))
   (let (object alist)
     (while (progn (skip-chars-forward " \t\n") (not (eobp)))
-      (if (looking-at djvu-annot-re)
+      (beginning-of-line)
+      (if (looking-at djvu-beg-object-re)
           (push (read (current-buffer)) object)
         (error "Unknown annotation `%s'" (buffer-substring-no-properties
                                           (point) (line-end-position)))))
 
-    ;; To simplify the editing of annotations, identify rect mapareas
-    ;; sharing the same text string.
     (dolist (elt object)
       (if (not (eq 'maparea (car elt)))
           (push elt alist)
-        (cond ((memq (car (nth 3 elt)) '(rect oval)) ; rect and oval
+        ;; To simplify the editing of annotations, identify rect mapareas
+        ;; sharing the same text string.
+        (cond ((eq 'rect (car (nth 3 elt))) ; rect
                (let ((area (djvu-area (nth 3 elt)))
                      e)
                  ;; Remove area destructively.
@@ -2461,7 +2591,7 @@ SHARED should be non-nil for a Shared Annotations buffer."
                          (not (setq e (assoc elt alist))))
                      (push (cons elt (list area)) alist)
                    (setcdr e (cons area (cdr e))))))
-              ((eq 'text (car (nth 3 elt))) ; text
+              ((memq (car (nth 3 elt)) '(text oval)) ; mapareas text, oval
                (setcar (nthcdr 3 elt) (djvu-area (nth 3 elt)))
                (push elt alist))
               (t (push elt alist)))))
@@ -2484,8 +2614,8 @@ SHARED should be non-nil for a Shared Annotations buffer."
                  (let ((c (car elt)))
                    (insert (format "(maparea %S\n %S\n ("
                                    (djvu-resolve-url (nth 1 c) doc) (nth 2 c))
-                           (mapconcat 'prin1-to-string (cdr elt) "\n  ") ")\n " ; rect and oval
-                           (mapconcat 'prin1-to-string (nthcdr 3 c) " ") ; rest
+                           (mapconcat #'prin1-to-string (cdr elt) "\n  ") ")\n " ; rect and oval
+                           (mapconcat #'prin1-to-string (nthcdr 3 c) " ") ; rest
                            ")")))
                 ((eq 'metadata (car elt)) ; metadata
                  (insert "(metadata")
@@ -2494,9 +2624,9 @@ SHARED should be non-nil for a Shared Annotations buffer."
                  (insert ")"))
                 ((not (eq 'maparea (car elt))) ; no maparea
                  (prin1 elt))
-                ((memq (car (nth 3 elt)) '(text line)) ; maparea text, line
+                ((memq (car (nth 3 elt)) '(text oval line poly)) ; maparea text, oval, line, poly
                  (insert (format "(maparea %S\n %S\n " (nth 1 elt) (nth 2 elt))
-                         (mapconcat 'prin1-to-string (nthcdr 3 elt) " ") ; rest
+                         (mapconcat #'prin1-to-string (nthcdr 3 elt) " ") ; rest
                          ")"))
                 (t (error "Djvu maparea %s undefined" (car (nth 3 elt)))))
           (insert "\n\n"))
@@ -2593,8 +2723,8 @@ If URL is an internal url, go to that page."
   (let ((dpos (djvu-mean-dpos (djvu-read-dpos)))
         (pagesize (djvu-ref pagesize))
         (color (djvu-interactive-color djvu-color-highlight)))
-    (list nil (read-string (format "(%s) Text: " color)
-                          nil nil nil djvu-inherit-input-method)
+    (list nil (read-string (format "(%s) Text: " (or color "no color"))
+                           nil nil nil djvu-inherit-input-method)
           (list (nth 0 dpos) (nth 1 dpos)
                 (+ (nth 0 dpos) (/ (car pagesize) 2))
                 (+ (nth 1 dpos) (/ (cdr pagesize) 30)))
@@ -2634,8 +2764,8 @@ is usually easier to use."
                     (or url "") (if comment (djvu-fill comment) ""))
             (apply 'format "(text %d %d %d %d)" area)
             (format " (%s)" (or border 'none))
-            (djvu-insert-color "backclr" backclr)
-            (djvu-insert-color "textclr" textclr)
+            (if backclr (djvu-insert-color "backclr" backclr) "")
+            (if textclr (djvu-insert-color "textclr" textclr) "")
             (if pushpin " (pushpin)" "")
             ")\n\n")
     (undo-boundary)))
@@ -2733,7 +2863,8 @@ With prefix LEFT mark left of beginning of line."
      (let* ((color (djvu-interactive-color djvu-color-url))
             (url (djvu-interactive-url color))
             (comment (djvu-read-string
-                      (format "(%s, %s) Annotation: " url color)
+                      (format "(%s, %s) Annotation: "
+                              url (or color "no color"))
                       region)))
        (list (car region) (cdr region) url comment color djvu-opacity 'xor))))
   (djvu-rect-region beg end url comment color opacity border))
@@ -2743,7 +2874,8 @@ With prefix LEFT mark left of beginning of line."
   (interactive
    (djvu-with-region region
      (let* ((color (djvu-interactive-color djvu-color-highlight))
-            (comment (djvu-read-string (format "(%s) Annotation: " color)
+            (comment (djvu-read-string (format "(%s) Annotation: "
+                                               (or color "no color"))
                                        region)))
        (list (car region) (cdr region) nil comment color djvu-opacity 'none))))
 
@@ -2834,15 +2966,15 @@ each defining a rect area for djvused."
     (unless (and djvu-rect-area-nodups
                  (save-excursion
                    (goto-char (point-min))
-                   (re-search-forward (mapconcat 'identity rects "[ \t\n]*")
+                   (re-search-forward (mapconcat #'identity rects "[ \t\n]*")
                                       nil t)))
       (goto-char (point-max))
       (insert (format "(maparea %S\n %S\n ("
                       (or url "") (if comment (djvu-fill comment) ""))
-              (mapconcat 'identity rects "\n  ")
+              (mapconcat #'identity rects "\n  ")
               ")\n"
               (djvu-insert-color "hilite" color)
-              (if opacity (format " (opacity %s)" opacity) "")
+              (if (and color opacity) (format " (opacity %s)" opacity) "")
               (format " (%s)" (or border 'none))
               ")\n\n")
       (undo-boundary))))
@@ -2863,8 +2995,8 @@ This value of `fill-column' defaults to `djvu-fill-column'."
   "Toggle between Mapareas rect and text."
   (interactive)
   (let ((bounds (djvu-object-bounds))
-        (rect-re "(rect \\(-?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+\\))")
-        (text-re "(text \\(-?[0-9]+ -?[0-9]+ -?[0-9]+ -?[0-9]+\\))")
+        (rect-re (format "(rect[\s\t]+%s)" djvu-coords-re))
+        (text-re (format "(text[\s\t]+%s)" djvu-coords-re))
         (color-re (format djvu-color-re "#" "" "")))
     (if (not bounds)
         (user-error "No object to update")
@@ -2876,7 +3008,7 @@ This value of `fill-column' defaults to `djvu-fill-column'."
           (cond ((re-search-forward rect-re nil t) ; Maparea rect
                  (if (save-match-data (re-search-forward rect-re nil t))
                      (user-error "Only single rect can be converted to text"))
-                 (replace-match (format "text %s" (match-string 1)))
+                 (replace-match (format "text %s" (match-string 2)))
                  (goto-char (point-min))
                  (let ((opacity
                         (if (re-search-forward " *(opacity \\([0-9]+\\))" nil t)
@@ -2900,7 +3032,7 @@ This value of `fill-column' defaults to `djvu-fill-column'."
                  ;; to duplicate the job.
                  (let ((opacity (save-match-data
                                   (read-number "Opacity: " djvu-opacity))))
-                   (replace-match (format "((rect %s))" (match-string 1)))
+                   (replace-match (format "((rect %s))" (match-string 2)))
                    (goto-char (point-min))
                    ;; Loop over matches of COLOR-RE as this general regexp
                    ;; also matches elements that so far we do not care about.
@@ -2915,13 +3047,6 @@ This value of `fill-column' defaults to `djvu-fill-column'."
                 (t
                  (user-error "Nothing to toggle"))))))))
 
-(defvar djvu-area-re
-  (format "(%s \\(%s\\))"
-          (regexp-opt '("rect" "oval" "text") t)
-          (mapconcat (lambda (_) "\\(-?[0-9]+\\)") '(1 2 3 4) " "))
-  "Regexp matching a Djvu area.
-Substring 1: area type, 2: coordinates, 3-6: individual coordinates.")
-
 (defun djvu-resize-internal (step)
   "Resize Djvu mapareas rect and text by STEP."
   (interactive "nStep: ")
@@ -2933,6 +3058,8 @@ Substring 1: area type, 2: coordinates, 3-6: individual coordinates.")
           (narrow-to-region (car bounds) (cdr bounds))
           (goto-char (point-min))
           (while (re-search-forward djvu-area-re nil t)
+            (if (string= "poly" (match-string 1))
+                (user-error "Cannot resize maparea poly"))
             (replace-match (format "%d %d %d %d"
                                    (- (djvu-match-number 3) step)
                                    (- (djvu-match-number 4) step)
@@ -2940,14 +3067,15 @@ Substring 1: area type, 2: coordinates, 3-6: individual coordinates.")
                                    (+ (djvu-match-number 6) step))
                              nil nil nil 2)))))))
 
-(defun djvu-shift-internal (shiftx shifty &optional all)
+(defun djvu-shift-internal (shiftx shifty &optional all scale)
   "Shift Djvu mapareas rect and text by SHIFTX and SHIFTY.
 With prefix ALL non-nil shift all mapareas of current page."
   (interactive
-   (let ((shift (mapcar 'string-to-number
+   (let ((shift (mapcar #'string-to-number
                         (split-string (read-string "Shiftx, shifty: ")
                                       "[\t\s\n,;]+" t "[\t\s\n]"))))
      (list (nth 0 shift) (nth 1 shift) current-prefix-arg)))
+  (unless (numberp scale) (setq scale 1))
   (save-excursion
     (save-restriction
       (unless all
@@ -2961,11 +3089,17 @@ With prefix ALL non-nil shift all mapareas of current page."
       ;; Cut off visible areas, drop invisble areas (with warning?)
       (while (re-search-forward djvu-area-re nil t)
         (replace-match (format "%d %d %d %d"
-                               (+ (djvu-match-number 3) shiftx)
-                               (+ (djvu-match-number 4) shifty)
-                               (+ (djvu-match-number 5) shiftx)
-                               (+ (djvu-match-number 6) shifty))
-                       nil nil nil 2)))))
+                               (+ (* (djvu-match-number 3) scale) shiftx)
+                               (+ (* (djvu-match-number 4) scale) shifty)
+                               (+ (* (djvu-match-number 5) scale) shiftx)
+                               (+ (* (djvu-match-number 6) scale) shifty))
+                       nil nil nil 2)
+        (if (string= "poly" (match-string 1))
+            (while (progn (skip-chars-forward "\s\t\n")
+                          (looking-at djvu-coord-xy-re))
+              (replace-match (format "%d %d"
+                                     (+ (* (djvu-match-number 1) scale) shiftx)
+                                     (+ (* (djvu-match-number 2) scale) shifty)))))))))
 
 (defun djvu-remove-linebreaks-internal ()
   "Remove linebreaks in Maparea string.
@@ -3047,6 +3181,7 @@ or maximum among the Nth elements of all arrays CI."
   ;; Assume that BEG has PROP.
   (let* ((zone (copy-sequence (get-text-property beg prop)))
          (max (aref zone 1))
+         (min (aref zone 3))
          (pnt beg)
          val)
     (while (and (/= pnt end)
@@ -3056,24 +3191,35 @@ or maximum among the Nth elements of all arrays CI."
         (aset zone 1 (min (aref zone 1) (aref val 1)))
         (setq max (max max (aref val 1))) ; descending words
         (aset zone 2 (max (aref zone 2) (aref val 2)))
-        (aset zone 3 (max (aref zone 3) (aref val 3)))))
+        (aset zone 3 (max (aref zone 3) (aref val 3)))
+        (setq min (min min (aref val 3))))) ; ascending words
 
     ;; The following is rather heuristic.  Suggestions for better
     ;; solutions welcome, though probably not worth the effort.
     ;; Set `djvu-descenders-re' to nil if you do not like this.
-    (if (and djvu-descenders-re
-             (eq prop 'word)
-             ;; descending words
-             (> 0.10 (/ (- max (aref zone 1))
-                       (float (- (aref zone 3) (aref zone 1)))))
-             (let ((string (buffer-substring-no-properties beg end)))
-               (not (or (= 1 (length string)) ; single-character string
-                        ;; all-uppercase string
-                        (string= string (upcase string))
-                        ;; descender characters
-                        (string-match djvu-descenders-re string)))))
-        (aset zone 1 (- (aref zone 1)
-                        (round (* 0.20 (- (aref zone 3) (aref zone 1)))))))
+    (if (and (or djvu-descenders-re djvu-ascenders-re)
+             (eq prop 'word))
+        (let* ((string (buffer-substring-no-properties beg end))
+               (long (< 1 (length string))) ; not a single-character string
+               case-fold-search)
+          (if (and long djvu-descenders-re
+                   ;; descending words
+                   (> 0.10 (/ (- max (aref zone 1))
+                              (float (- (aref zone 3) (aref zone 1)))))
+                   ;; all-uppercase string
+                   (not (string= string (upcase string)))
+                   ;; descender characters
+                   (not (string-match djvu-descenders-re string)))
+              (aset zone 1 (- (aref zone 1)
+                              (round (* 0.20 (- (aref zone 3) (aref zone 1)))))))
+          (if (and long djvu-ascenders-re
+                   ;; ascending words
+                   (> 0.10 (/ (- (aref zone 3) min)
+                              (float (- (aref zone 3) (aref zone 1)))))
+                   ;; ascender characters
+                   (not (string-match djvu-ascenders-re string)))
+              (aset zone 3 (+ (aref zone 3)
+                              (round (* 0.20 (- (aref zone 3) (aref zone 1)))))))))
     zone))
 
 (defun djvu-region-count (beg end prop)
@@ -3097,7 +3243,8 @@ or maximum among the Nth elements of all arrays CI."
           (djvu-convert-hash)
           (goto-char (point-min))
           (while (progn (skip-chars-forward " \t\n") (not (eobp)))
-            (if (looking-at djvu-annot-re)
+            (beginning-of-line)
+            (if (looking-at djvu-beg-object-re)
                 (condition-case nil
                     (push (read (current-buffer)) object)
                   (error (error "Syntax error in annotations")))
@@ -3132,14 +3279,15 @@ file SCRIPT.  DOC defaults to the current Djvu document."
                  (prin1 elt)
                  (insert "\n"))
                 ((or (not (eq 'maparea (car elt))) ; not maparea
-                     (eq 'line (car (nth 3 elt)))) ; maparea line
+                     (memq (car (nth 3 elt)) '(line poly))) ; maparea line, poly
                  (prin1 elt)
                  (insert "\n"))
-                ((consp (car (nth 3 elt))) ; maparea rect and oval
+                ((consp (car (nth 3 elt))) ; maparea rect
                  (dolist (area (nth 3 elt))
                    (insert (prin1-to-string
                             (apply 'list (car elt) (nth 1 elt) (nth 2 elt)
-                                   (djvu-area area t) (nthcdr 4 elt))) "\n"))
+                                   (djvu-area area t) (nthcdr 4 elt)))
+                           "\n"))
                  (setq id (1+ id))
                  (push (djvu-rect-elt
                         ;; `djvu-rect-elt' expects that the rect areas are at
@@ -3149,11 +3297,12 @@ file SCRIPT.  DOC defaults to the current Djvu document."
                               (nth 3 elt))
                         id)
                        rect-list))
-                ((eq 'text (car (nth 3 elt))) ; maparea text
+                ((memq (car (nth 3 elt)) '(text oval)) ; maparea text, oval
                  (insert (prin1-to-string
                           (apply 'list (car elt) (nth 1 elt) (nth 2 elt)
                                  (djvu-area (nth 3 elt) t)
-                                 (nthcdr 4 elt))) "\n"))
+                                 (nthcdr 4 elt)))
+                         "\n"))
                 (t (error "Djvu maparea %s undefined" (car (nth 3 elt))))))
         (insert ".\n")
         (djvu-convert-hash t)
@@ -3181,6 +3330,7 @@ You get what you want."
     ;; Put this in a separate buffer!
     (with-current-buffer buffer
       (let ((buffer-undo-list t)
+            (djvu-init t)
             buffer-read-only)
         (djvu-script-mode)
         (erase-buffer)
@@ -3212,18 +3362,12 @@ You get what you want."
             (let* ((object (djvu-object bounds))
                    (area (nth 3 object)))
               (if (eq (car object) 'maparea)
-                  (cond ((memq (car area) '(text line))
+                  (cond ((memq (car area) '(text oval line poly))
                          (cdr (nth 3 object)))
-                        ((consp area) ; maparea rect and oval
+                        ((consp area) ; maparea rect
                          (cdar area))))))))))
 
 ;;; Manipulate annotations
-
-(defvar djvu-beg-object-re
-  (concat "^[\s\t]*(" (regexp-opt '("background" "zoom" "mode" "align"
-                                    "maparea" "metadata" "bookmarks")
-                                  t))
-  "Regexp matching the beginning of Djvu annotation object.")
 
 (defun djvu-object-bounds ()
   "Return bounds (BEG . END) of Djvu object that contains or follows point.
@@ -3258,7 +3402,7 @@ Return nil if no such object can be found."
 
 (defun djvu-update-color (color)
   "Update color attribute of Djvu maparea to COLOR."
-  (interactive (list (completing-read "New Color: " djvu-color-alist nil t)))
+  (interactive (list (djvu-interactive-color-read)))
   (let ((dpos (djvu-dpos))
         (doc djvu-doc))
     (with-current-buffer (djvu-ref annot-buf doc)
@@ -3271,19 +3415,30 @@ Return nil if no such object can be found."
 If no such attribute exists insert a new one.
 Prefix arg OPACITY is the opacity to use."
   (interactive
-   (list (completing-read "New Color: " djvu-color-alist nil t)
-         (if current-prefix-arg
-             (read-number "Opacity: "))))
+   (let ((color (djvu-interactive-color-read)))
+     (list color
+           (if (and color current-prefix-arg)
+               (read-number "Opacity: ")))))
   (let ((bounds (djvu-object-bounds))
         (opacity (or opacity djvu-opacity)))
     (if bounds
         (save-excursion
           (goto-char (car bounds))
-          (cond ((re-search-forward
+          (cond ((not color)
+                 ;; remove color and opacity attributes
+                 (when (re-search-forward
+                        (format djvu-color-re "#" "" "") (cdr bounds) t)
+                   (replace-match "")
+                   (if (looking-at "[\s\t\n]+") (replace-match "")))
+                 (goto-char (car bounds))
+                 (when (re-search-forward "(opacity [0-9]+)" (cdr bounds) t)
+                   (replace-match "")
+                   (if (looking-at "[\s\t\n]+") (replace-match ""))))
+                ((re-search-forward
                   (format djvu-color-re "#" "" "") (cdr bounds) t)
                  ;; update existing color attribute
                  (let ((attr (match-string 1)))
-                   (cond ((member attr '("hilite" "lineclr"))
+                   (cond ((member attr '("hilite" "lineclr" "border"))
                           (replace-match (cdr (assoc color djvu-color-alist))
                                          nil nil nil 2))
                          ((string= attr "backclr")
@@ -3301,6 +3456,14 @@ Prefix arg OPACITY is the opacity to use."
                            (goto-char (car bounds))
                            (re-search-forward "(opacity [0-9]+)" (cdr bounds) t))
                    (insert (format " (opacity %d)" opacity))))
+                ((re-search-forward "(line" (cdr bounds) t)
+                 (goto-char (1- (cdr bounds)))
+                 (insert (format " (lineclr %s)"
+                                 (cdr (assoc color djvu-color-alist)))))
+                ((re-search-forward "(poly" (cdr bounds) t)
+                 (goto-char (1- (cdr bounds)))
+                 (insert (format " (border %s) (border_avis)"
+                                 (cdr (assoc color djvu-color-alist)))))
                 ((re-search-forward "(text" (cdr bounds) t)
                  (goto-char (1- (cdr bounds)))
                  (insert (format " (backclr %s)"
@@ -3340,7 +3503,7 @@ Prefix arg OPACITY is the opacity to use."
     ;; Remove duplicate attribute
     (setq url (or (delete-dups (delete "" url)) '("")))
     (if (nth 1 url) (user-error "Cannot merge multiple URLs"))
-    (setq text (mapconcat 'identity (nreverse (delete "" text)) "\n"))
+    (setq text (mapconcat #'identity (nreverse (delete "" text)) "\n"))
     (setq hilite (delete-dups hilite))
     (if (nth 1 hilite) (user-error "Cannot merge multiple hilites"))
     (setq opacity (delete-dups opacity))
@@ -3352,7 +3515,7 @@ Prefix arg OPACITY is the opacity to use."
     (goto-char beg)
     (delete-region beg end)
     (insert (format "(maparea %S\n %S\n (" (car url) text)
-            (mapconcat 'prin1-to-string (nreverse rect) "\n  ") ")\n"
+            (mapconcat #'prin1-to-string (nreverse rect) "\n  ") ")\n"
             (if hilite (format " (hilite %s)" (car hilite)) "")
             (if opacity (format " (opacity %s)" (car opacity)) "")
             (format " (%s)" (car border))
@@ -3509,6 +3672,58 @@ Return nil if OBJECT does not have internal URLs."
       (djvu-insert-bookmarks (nthcdr 2 elt) indent1)
       (insert ")"))))
 
+(defun djvu-read-bookmarks (&optional doc)
+  "Read bookmarks of a Djvu document from bookmarks buffer."
+  (let (object)
+    (with-current-buffer (djvu-ref bookmarks-buf doc)
+      (save-excursion
+        (save-restriction
+          (widen)
+          (goto-char (point-min))
+          (unless (eobp)
+            (condition-case nil
+                (setq object (read (current-buffer)))
+              (error (error "Syntax error in bookmarks"))))
+          (skip-chars-forward " \t\n")
+          ;; We should have swallowed all bookmarks.
+          (unless (eobp)
+            (error "Syntax error in bookmarks (position %s)" (point))))))
+    (if (and object (not (eq 'bookmarks (car object))))
+        (error "Malformed bookmarks"))
+    object))
+
+(defun djvu-reformat-bookmarks (&optional doc)
+  "Reformat Bookmarks buffer for Djvu document DOC."
+  (interactive)
+  (with-current-buffer (djvu-ref bookmarks-buf doc)
+    (let ((pnt (point))
+          (object (djvu-read-bookmarks doc)))
+      (erase-buffer)
+      (insert "(bookmarks")
+      (djvu-insert-bookmarks (cdr object) " ")
+      (insert ")\n")
+      (goto-char pnt))))
+
+(defun djvu-save-bookmarks (script &optional doc)
+  "Save bookmarks of a Djvu document.
+This dumps the content of DOC's bookmarks buffer into the djvused script
+file SCRIPT. DOC defaults to the current Djvu document."
+  (unless doc (setq doc djvu-doc))
+  (let ((object (djvu-read-bookmarks doc)))
+    (with-temp-buffer
+      (setq buffer-file-coding-system 'utf-8)
+      (insert "set-outline\n")
+      (when object
+        (insert "(bookmarks")
+        (let ((djvu-doc doc)) ; DOC should definitely be initialized above
+          (djvu-insert-bookmarks (cdr object) " "))
+        (insert ")\n"))
+      (insert ".\n")
+      (write-region nil nil script t 0)) ; append to SCRIPT
+    (djvu-init-outline (cdr object) doc)))
+
+;;; Djvu Outline mode
+
 (defun djvu-init-outline (object &optional doc)
   (with-current-buffer (djvu-ref outline-buf doc)
     (let (buffer-read-only)
@@ -3562,63 +3777,16 @@ PNT defaults to position of point."
       (forward-line))
     (goto-char pnt)))
 
-(defun djvu-read-bookmarks (&optional doc)
-  "Read bookmarks of a Djvu document from bookmarks buffer."
-  (let (object)
-    (with-current-buffer (djvu-ref bookmarks-buf doc)
-      (save-excursion
-        (save-restriction
-          (widen)
-          (goto-char (point-min))
-          (unless (eobp)
-            (condition-case nil
-                (setq object (read (current-buffer)))
-              (error (error "Syntax error in bookmarks"))))
-          (skip-chars-forward " \t\n")
-          ;; We should have swallowed all bookmarks.
-          (unless (eobp)
-            (error "Syntax error in bookmarks (end of buffer)")))))
-    (if (and object (not (eq 'bookmarks (car object))))
-        (error "Malformed bookmarks"))
-    object))
-
-(defun djvu-reformat-bookmarks (&optional doc)
-  "Reformat Bookmarks buffer for Djvu document DOC."
-  (interactive)
-  (with-current-buffer (djvu-ref bookmarks-buf doc)
-    (let ((pnt (point))
-          (object (djvu-read-bookmarks doc)))
-      (erase-buffer)
-      (insert "(bookmarks")
-      (djvu-insert-bookmarks (cdr object) " ")
-      (insert ")\n")
-      (goto-char pnt))))
-
-(defun djvu-save-bookmarks (script &optional doc)
-  "Save bookmarks of a Djvu document.
-This dumps the content of DOC's bookmarks buffer into the djvused script
-file SCRIPT. DOC defaults to the current Djvu document."
-  (unless doc (setq doc djvu-doc))
-  (let ((object (djvu-read-bookmarks doc)))
-    (with-temp-buffer
-      (setq buffer-file-coding-system 'utf-8)
-      (insert "set-outline\n")
-      (when object
-        (insert "(bookmarks")
-        (let ((djvu-doc doc)) ; DOC should definitely be initialized above
-          (djvu-insert-bookmarks (cdr object) " "))
-        (insert ")\n"))
-      (insert ".\n")
-      (write-region nil nil script t 0)) ; append to SCRIPT
-    (djvu-init-outline (cdr object) doc)))
-
 ;;; Image minor mode
 
 (defmacro djvu-with-event-buffer (event &rest body)
   "With buffer of EVENT current, evaluate BODY."
   (declare (indent 1))
   ;; Fixme: abort if `minibufferp' returns non-nil?
-  `(with-current-buffer (window-buffer (posn-window (event-start ,event)))
+  `(with-current-buffer
+       (window-buffer (let ((win (posn-window (event-start ,event))))
+                        (if (windowp win) win
+                          (user-error "Event not over window"))))
      ,@body))
 
 (defun djvu-image-toggle ()
@@ -3634,17 +3802,25 @@ file SCRIPT. DOC defaults to the current Djvu document."
   "Image display of current page."
   :lighter "Image"
 
+  ;; Keybindings for motion commands adopted from `image-mode-map'
   :keymap '((" "              . djvu-image-scroll-up)
             ([?\S-\ ]         . djvu-image-scroll-down)
             ("\C-?"           . djvu-image-scroll-down)
-            ("\C-n"           . djvu-image-next-line)
-            ([down]           . djvu-image-next-line)
-            ("\C-p"           . djvu-image-previous-line)
-            ([up]             . djvu-image-previous-line)
-            ([remap forward-char]  . image-forward-hscroll)
-            ([remap backward-char] . image-backward-hscroll)
-            ([remap right-char]    . image-forward-hscroll)
-            ([remap left-char]     . image-backward-hscroll)
+            ([remap scroll-up-command]      . djvu-image-scroll-up)
+            ([remap scroll-down-command]    . djvu-image-scroll-down)
+            ([remap next-line]              . djvu-image-next-line)
+            ([remap previous-line]          . djvu-image-previous-line)
+            ([remap forward-char]           . image-forward-hscroll)
+            ([remap backward-char]          . image-backward-hscroll)
+            ([remap right-char]             . image-forward-hscroll)
+            ([remap left-char]              . image-backward-hscroll)
+            ([remap move-beginning-of-line] . image-bol)
+            ([remap move-end-of-line]       . image-eol)
+            ([remap beginning-of-buffer]    . image-bob)
+            ([remap end-of-buffer]          . image-eob)
+            ;;
+            ("+" . djvu-image-zoom-in)
+            ("-" . djvu-image-zoom-out)
 
             ([drag-mouse-1]   . djvu-mouse-rect-area)
             ([S-drag-mouse-1] . djvu-mouse-text-area)
@@ -3666,26 +3842,43 @@ file SCRIPT. DOC defaults to the current Djvu document."
             ([M-drag-mouse-1] . djvu-mouse-word-area)
             ([M-down-mouse-1] . djvu-mouse-drag-track-area)
             ([drag-mouse-3]   . djvu-mouse-word-area) ; substitute
-            ([down-mouse-3]   . djvu-mouse-drag-track-area) ; substitute
-            ;;
-            ("+" . djvu-image-zoom-in)
-            ("-" . djvu-image-zoom-out))
+            ([down-mouse-3]   . djvu-mouse-drag-track-area)) ; substitute
 
-  ;; Adopted from `doc-view-mode'
-  (image-mode-setup-winprops) ; record current scroll settings
-  ;; Don't scroll unless the user specifically asked for it.
-  (setq-local auto-hscroll-mode nil)
+  (image-mode-setup-winprops)
 
-  (if (and djvu-image-mode
-           (not (get-text-property (point-min) 'display)))
-      ;; Remember DPOS if we enable `djvu-image-mode'.
-      (djvu-set read-pos (let (djvu-image-mode)
-                           (djvu-read-dpos))))
-  (let ((tmp (and (not djvu-image-mode)
-                  (get-text-property (point-min) 'display))))
-    (djvu-image)
-    ;; Go to DPOS if we disable `djvu-image-mode'.
-    (if tmp (djvu-goto-read (djvu-ref read-pos)))))
+  (let* ((display (get-text-property (point-min) 'display))
+         (enable (and djvu-image-mode (not display)))
+         (disable (and (not djvu-image-mode) display)))
+    (cond (enable
+           ;; Remember DPOS if we enable `djvu-image-mode'.
+           (djvu-set read-pos (let (djvu-image-mode)
+                                (djvu-read-dpos)))
+           ;; Don't scroll unless the user specifically asked for it.
+           (setq-local auto-hscroll-mode nil))
+          (disable
+           ;; Remember scrolling when we leave image mode
+           (djvu-set image-vscroll (djvu-image-vscroll))
+           (djvu-set image-hscroll (window-hscroll))
+           (set-window-hscroll (selected-window) 0)))
+
+    (if (or enable disable) (djvu-image))
+
+    (cond (enable
+           ;; Code adopted from `image-bol'.
+           (let* ((image-size (image-display-size
+                               (image-get-display-property)))
+                  (img-width  (ceiling (car image-size)))
+                  (img-height (ceiling (cdr image-size)))
+                  (edges (window-inside-edges))
+                  (win-width  (- (nth 2 edges) (nth 0 edges)))
+                  (win-height (- (nth 3 edges) (nth 1 edges))))
+             (image-set-window-vscroll (min (djvu-ref image-vscroll)
+                                            (max 0 (- img-height win-height))))
+             (image-set-window-hscroll (min (djvu-ref image-hscroll)
+                                            (max 0 (- img-width win-width))))))
+          (disable
+           ;; Go to DPOS if we disable `djvu-image-mode'.
+           (djvu-goto-read (djvu-ref read-pos))))))
 
 (defun djvu-image (&optional isize)
   "If `djvu-image-mode' is enabled, display image of current Djvu page.
@@ -3695,9 +3888,8 @@ Otherwise remove the image."
   ;; in particular, for the "bare" calls of `djvu-image' by
   ;; `djvu-image-zoom-in' and `djvu-image-zoom-out'.
   (if (not djvu-image-mode)
-      (if (get-text-property (point-min) 'display)
-          (let (buffer-read-only)
-            (remove-text-properties (point-min) (point-max) '(display nil))))
+      (let (buffer-read-only)
+        (remove-text-properties (point-min) (point-max) '(display nil)))
     ;; Update image if necessary.
     (if (or (not (eq (djvu-ref page) (car (djvu-ref image))))
             (and isize
@@ -3728,91 +3920,115 @@ Otherwise remove the image."
                                      'pbm t))
                doc)))))
     ;; Display image.
-    (let ((hscroll (window-hscroll))
-          buffer-read-only)
+    (let (buffer-read-only)
       (if (= (point-min) (point-max)) (insert " "))
       (put-text-property (point-min) (point-max)
-                         'display (nthcdr 2 (djvu-ref image)))
-      (set-window-hscroll (selected-window) hscroll))))
+                         'display (nthcdr 2 (djvu-ref image))))))
 
-;; The following scrolling commands are adapted from `doc-view-mode'.
-;; Up to Emacs 26, the functions `image-scroll-down', `image-scroll-up',
-;; `image-next-line', and `image-previous-line' return multiples of the
-;; character height.  Starting with Emacs 27 (commit 9c66b09950),
-;; these functions return pixel values.
+;; The following scrolling commands are adapted from `image-mode'
+;; and `doc-view-mode'.
+
+(defun djvu-image-vscroll ()
+  "Return the amount by which a page image is scrolled vertically."
+  ;; Up to Emacs 26, the functions `image-scroll-down', `image-scroll-up',
+  ;; `image-next-line', and `image-previous-line' return multiples of the
+  ;; character height.  Starting with Emacs 27, these functions return
+  ;; pixel values.  To be compatible, we must call `window-vscroll'
+  ;; without or with arg PIXELS-P non-nil.
+  (window-vscroll nil (<= 27 (string-to-number emacs-version))))
 
 (defun djvu-image-scroll-up (&optional n)
   "Scroll image of current page upward by N lines.
 At the bottom of the image, when `djvu-continuous' is non-nil
-or prefix N is nil, go to the image of the next page.
-Prefix N may take the same values as arg N of `image-scroll-up'.
-For historical reasons, this includes the range of values
-of `current-prefix-arg'."
+go to the image of the next page.
+Prefix N may take the same values as arg N of `image-scroll-up'."
   (interactive "P") ; same as `image-scroll-up'
-  (if (and (= (window-vscroll nil (<= 27 (string-to-number emacs-version)))
-              (image-scroll-up n))
-           (or djvu-continuous (not n))
+  (if (and (= (djvu-image-vscroll) (image-scroll-up n))
+           djvu-continuous
            (< (djvu-ref page) (djvu-ref pagemax)))
       (let ((hscroll (window-hscroll)))
         (djvu-next-page 1)
         (image-bob)
         (image-bol 1)
-        (set-window-hscroll (selected-window) hscroll))))
+        (image-set-window-hscroll hscroll))))
 
 (defun djvu-image-scroll-down (&optional n)
   "Scroll image of current page downward N lines.
 At the top of the image, when `djvu-continuous' is non-nil
-or prefix N is nil, go to the image of the previous page.
-Prefix N may take the same values as arg N of `image-scroll-down'.
-For historical reasons, this includes the range of values
-of `current-prefix-arg'."
+go to the image of the previous page.
+Prefix N may take the same values as arg N of `image-scroll-down'."
   (interactive "P") ; same as `image-scroll-down'
-  (if (and (= (window-vscroll nil (<= 27 (string-to-number emacs-version)))
-              (image-scroll-down n))
-           (or djvu-continuous (not n))
+  (if (and (= (djvu-image-vscroll) (image-scroll-down n))
+           djvu-continuous
            (< 1 (djvu-ref page)))
       (let ((hscroll (window-hscroll)))
         (djvu-prev-page 1)
         (image-eob)
         (image-bol 1)
-        (set-window-hscroll (selected-window) hscroll))))
+        (image-set-window-hscroll hscroll))))
 
 (defun djvu-image-next-line (&optional n)
   "Scroll image of current page upward by N lines.
 At the bottom of the image, when `djvu-continuous' is non-nil,
 go to the image of the next page."
   (interactive "p")
-  (if (and (= (window-vscroll nil (<= 27 (string-to-number emacs-version)))
-              (image-next-line n))
+  (if (and (= (djvu-image-vscroll) (image-next-line n))
            djvu-continuous
            (< (djvu-ref page) (djvu-ref pagemax)))
       (let ((hscroll (window-hscroll)))
         (djvu-next-page 1)
         (image-bob)
         (image-bol 1)
-        (set-window-hscroll (selected-window) hscroll))))
+        (image-set-window-hscroll hscroll))))
 
 (defun djvu-image-previous-line (&optional n)
   "Scroll image of current page downward N lines.
 At the top of the image, when `djvu-continuous' is non-nil,
 go to the image of the previous page."
   (interactive "p")
-  (if (and (= (window-vscroll nil (<= 27 (string-to-number emacs-version)))
-              (image-previous-line n))
+  (if (and (= (djvu-image-vscroll) (image-previous-line n))
            djvu-continuous
            (< 1 (djvu-ref page)))
       (let ((hscroll (window-hscroll)))
         (djvu-prev-page 1)
         (image-eob)
         (image-bol 1)
-        (set-window-hscroll (selected-window) hscroll))))
+        (image-set-window-hscroll hscroll))))
+
+(defun djvu-image-zoom-in (&optional zoom)
+  (interactive)
+  ;; FIXME: this preserves the upper left corner of the image.
+  ;; If possible, we should preserve the center of the image.
+  (let ((hscroll (window-hscroll))
+        (vscroll (djvu-image-vscroll))
+        (zoom (or zoom djvu-image-zoom)))
+    (djvu-image (round (* (nth 1 (djvu-ref image)) zoom)))
+    (image-set-window-hscroll (round (* hscroll zoom)))
+    (image-set-window-vscroll (round (* vscroll zoom)))))
+
+(defun djvu-image-zoom-out (&optional zoom)
+  (interactive)
+  (let ((hscroll (window-hscroll))
+        (vscroll (djvu-image-vscroll))
+        (zoom (or zoom djvu-image-zoom)))
+    (djvu-image (round (/ (nth 1 (djvu-ref image)) zoom)))
+    (image-set-window-hscroll (round (/ hscroll zoom)))
+    (image-set-window-vscroll (round (/ vscroll zoom)))))
+
+;; Image-based editing commands
 
 (defun djvu-mouse-drag-track-area (start-event &optional line)
   "Track drag over image."
   (interactive "e")
   ;; Inspired by `mouse-drag-track'.
-  (setq track-mouse t)
-  (set-transient-map
+  (let ((old-track-mouse track-mouse))
+    ;; Disable `djvu-modified' during tracking,
+    ;; but we just remember the current modified flag.
+    ;; This makes the code much faster!
+    (remove-hook 'post-command-hook #'djvu-modified t)
+    (setq djvu-modified (buffer-modified-p))
+    (setq track-mouse 'drag-tracking)
+    (set-transient-map
      (let ((map (make-sparse-keymap)))
        (define-key map [mouse-movement]
          (lambda (event) (interactive "e")
@@ -3823,7 +4039,9 @@ go to the image of the previous page."
                               line))))
        map)
      t (lambda ()
-         (setq track-mouse nil))))
+         (add-hook 'post-command-hook #'djvu-modified nil t)
+         (setq djvu-modified nil)
+         (setq track-mouse old-track-mouse)))))
 
 (defun djvu-image-rect (&optional event line)
   "For PPM image specified via EVENT mark rectangle by inverting bits."
@@ -3884,25 +4102,19 @@ go to the image of the previous page."
                                               width))))))
                     (invert i (+ i 3)))
                   (setq x (+ x step)))))))
-        (with-silent-modifications
+        (let (buffer-read-only)
           (put-text-property
            (point-min) (point-max) 'display
            (create-image image 'pbm t)))
+        (restore-buffer-modified-p djvu-modified)
         (image-flush old-image))
     ;; Restore unmodified image
-    (let ((old-image (get-text-property (point-min) 'display)))
-      (with-silent-modifications
-        (put-text-property (point-min) (point-max)
-                           'display (nthcdr 2 (djvu-ref image))))
+    (let ((old-image (get-text-property (point-min) 'display))
+          buffer-read-only)
+      ;; The modified flag is set by `djvu-modified' in `post-command-hook'.
+      (put-text-property (point-min) (point-max)
+                         'display (nthcdr 2 (djvu-ref image)))
       (image-flush old-image))))
-
-(defun djvu-image-zoom-in ()
-  (interactive)
-  (djvu-image (round (* (nth 1 (djvu-ref image)) 1.2))))
-
-(defun djvu-image-zoom-out ()
-  (interactive)
-  (djvu-image (round (/ (nth 1 (djvu-ref image)) 1.2))))
 
 (defun djvu-event-to-area (event &optional dir)
   "Convert mouse EVENT to Djvu area coordinates."
@@ -3938,13 +4150,15 @@ go to the image of the previous page."
   (interactive "e")
   ;; Mouse events ignore prefix args?
   (djvu-with-event-buffer event
-    (djvu-image-rect event)
-    (let ((color (djvu-interactive-color djvu-color-highlight)))
-      (djvu-rect-area nil (read-string (format "(%s) Highlight: " color)
-                                      nil nil nil djvu-inherit-input-method)
-                      (list (djvu-event-to-area event))
-                      color djvu-opacity 'none))
-    (djvu-image-rect)))
+    (unwind-protect
+        (let ((color (djvu-interactive-color djvu-color-highlight))
+              ;; Do RECTS first as this may throw a user error.
+              (rects (list (djvu-event-to-area event))))
+          (djvu-rect-area nil (read-string (format "(%s) Highlight: "
+                                                   (or color "no color"))
+                                           nil nil nil djvu-inherit-input-method)
+                          rects color djvu-opacity 'none))
+      (djvu-image-rect))))
 
 (defun djvu-mouse-text-area (event)
   (interactive "e")
@@ -3957,14 +4171,15 @@ go to the image of the previous page."
 (defun djvu-mouse-text-area-internal (event prompt &optional pushpin)
   ;; Mouse events ignore prefix args?
   (djvu-with-event-buffer event
-    (djvu-image-rect event)
-    (let ((color (djvu-interactive-color djvu-color-highlight)))
-      (djvu-text-area nil (read-string (format "(%s) %s: " color prompt)
-                                      nil nil nil djvu-inherit-input-method)
-                      (djvu-event-to-area event) nil
-                      (djvu-color-background color)
-                      nil pushpin))
-    (djvu-image-rect)))
+    (unwind-protect
+        (let ((color (djvu-interactive-color djvu-color-highlight))
+              ;; Do AREA first as this may throw a user error.
+              (area (djvu-event-to-area event)))
+          (djvu-text-area nil (read-string (format "(%s) %s: "
+                                                   (or color "no color") prompt)
+                                           nil nil nil djvu-inherit-input-method)
+                          area nil (djvu-color-background color) nil pushpin))
+      (djvu-image-rect))))
 
 (defun djvu-mouse-line-area (event)
   (interactive "e")
@@ -3980,17 +4195,21 @@ go to the image of the previous page."
 
 (defun djvu-mouse-line-area-internal (event &optional dir)
   (djvu-with-event-buffer event
-    (let* ((line (djvu-event-to-area event dir))
-           (color (djvu-interactive-color djvu-color-line))
-           (text (read-string (format "(%s) Line: " color)
-                              nil nil nil djvu-inherit-input-method)))
-      (cond ((eq dir 'horiz)
-             (setq line (list (nth 0 line) (nth 1 line)
-                              (nth 2 line) (nth 1 line))))
-            ((eq dir 'vert)
-             (setq line (list (nth 0 line) (nth 1 line)
-                              (nth 0 line) (nth 3 line)))))
-      (djvu-line-area nil text line nil nil djvu-line-width djvu-color-line))))
+    (unwind-protect
+        ;; Do LINE first as this may throw a user error.
+        (let* ((line (djvu-event-to-area event dir))
+               (color (djvu-interactive-color djvu-color-line))
+               (text (read-string (format "(%s) Line: " (or color "no color"))
+                                  nil nil nil djvu-inherit-input-method)))
+          (cond ((eq dir 'horiz)
+                 (setq line (list (nth 0 line) (nth 1 line)
+                                  (nth 2 line) (nth 1 line))))
+                ((eq dir 'vert)
+                 (setq line (list (nth 0 line) (nth 1 line)
+                                  (nth 0 line) (nth 3 line)))))
+          (djvu-line-area nil text line nil nil
+                          djvu-line-width djvu-color-line))
+      (djvu-image-rect))))
 
 (defun djvu-line-area (url text line &optional border arrow width lineclr)
   ;; Record position where annotation was made.
@@ -4038,11 +4257,15 @@ go to the image of the previous page."
 (defun djvu-mouse-word-area (event)
   "Insert word."
   (interactive "e")
-  (with-current-buffer (djvu-with-event-buffer event
-                         (djvu-ref text-buf))
-    (djvu-text-line-area (read-string "Text: " nil nil nil
-                                      djvu-inherit-input-method)
-                         (djvu-bound-area (djvu-event-to-area event)))))
+  (djvu-with-event-buffer event
+    (unwind-protect
+        ;; Do AREA first as this may throw a user error.
+        (let ((area (djvu-event-to-area event)))
+          (with-current-buffer (djvu-ref text-buf)
+            (djvu-text-line-area (read-string "Text: " nil nil nil
+                                              djvu-inherit-input-method)
+                                 area)))
+      (djvu-image-rect))))
 
 ;;; Miscellaneous commands
 
@@ -4106,17 +4329,16 @@ If the width of a page exceeds WIDTH, increase the page resolution DPI
 accordingly."
   (interactive "nWidth: \nnWidth: %s, dpi: ")
   (unless doc (setq doc djvu-doc))
-  (let ((count 0) job)
+  (let (job)
     (with-temp-buffer
       (djvu-djvused doc t "-e" "size")
       (goto-char (point-min))
       (let ((page 0))
         (while (looking-at "width=\\([[:digit:]]+\\)")
           (setq page (1+ page))
-          (let ((w (djvu-match-number 1)))
-            (when (< width w)
-              (push (cons page (/ (* w dpi) width)) job)
-              (setq count (1+ count))))
+          (let ((d (/ (* (djvu-match-number 1) dpi) width)))
+            (if (< dpi d)
+                (push (cons page d) job)))
           (forward-line))))
     (if (not job)
         (message "Nothing to unify")
@@ -4126,7 +4348,7 @@ accordingly."
                                          (car elt) (cdr elt)))
                                job "; ")
                     "-s")
-      (message "%s pages updated: %s" count
+      (message "%s pages updated: %s" (length job)
                (mapconcat (lambda (elt) (format "%d" (car elt)))
                           (nreverse job) ", ")))))
 
