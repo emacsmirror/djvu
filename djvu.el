@@ -2250,7 +2250,7 @@ Branches of OBJECT that point to empty strings are removed."
       (if remove
           (let ((tail (nthcdr 4 object)))
             (dolist (elt remove)
-              ;; `delq' removes all occurences of ELT from TAIL.
+              ;; `delq' removes all occurrences of ELT from TAIL.
               (setcdr tail (delq elt (cdr tail))))))
       (cond ((setq zone (aref zones depth))
              (setcdr object (append (mapcar #'identity zone)
@@ -3086,7 +3086,7 @@ With prefix ALL non-nil shift all mapareas of current page."
       (goto-char (point-min))
       ;; FIXME: provide alternative regexp for text buffer.
       ;; FIXME: honor page boundaries:
-      ;; Cut off visible areas, drop invisble areas (with warning?)
+      ;; Cut off visible areas, drop invisible areas (with warning?)
       (while (re-search-forward djvu-area-re nil t)
         (replace-match (format "%d %d %d %d"
                                (+ (* (djvu-match-number 3) scale) shiftx)
