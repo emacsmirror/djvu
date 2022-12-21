@@ -17,12 +17,12 @@
 ;; GNU General Public License for more details.
 
 ;; You should have received a copy of the GNU General Public License
-;; along with this program.  If not, see <http://www.gnu.org/licenses/>.
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 ;;; Commentary:
 
 ;; This package is a front end for the command-line program djvused
-;; from DjVuLibre, see http://djvu.sourceforge.net/.  It assumes you
+;; from DjVuLibre, see https://djvu.sourceforge.net/.  It assumes you
 ;; have the programs djvused, djview, ddjvu, and djvm installed.
 ;; The main purpose of djvu.el is to edit Djvu documents via djvused.
 ;; If you only seek an Emacs viewer for Djvu documents, you may be
